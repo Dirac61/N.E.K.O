@@ -2316,6 +2316,7 @@
         "selectionIntroImageAlt": "N.E.K.O storage migration illustration",
         "statusUnexpected": "The storage maintenance status API returned an unrecognized result.",
         "storageBootstrapBlocking": "Storage still needs recovery or migration, so this session cannot continue yet.",
+        "storagePolicyWriteFailed": "Failed to write the storage location configuration. The previous state was restored; check that the local state directory is writable and try again.",
         "targetNotEmpty": "The target already contains runtime data. Confirm the target before migration.",
         "systemStatusUnavailable": "The local service status could not be confirmed. Please try again.",
         "systemStatusUnexpected": "The storage startup status API returned an unrecognized result.",

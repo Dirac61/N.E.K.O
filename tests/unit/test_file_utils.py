@@ -204,6 +204,60 @@ def test_missing_temp_file_during_cleanup_is_tolerated(tmp_path, monkeypatch):
         atomic_write_json(target, {"v": 1})
 
 
+# ── 临时文件创建：失败要快，重试要有界 ──────────────────────────────────
+
+
+def test_temp_create_permission_denied_fails_fast(tmp_path, monkeypatch):
+    """目录拒绝创建临时文件时，必须第一次就抛出，不得重试。
+
+    回归点：``tempfile.mkstemp`` 在 Windows 上遇到 PermissionError 时，只要目录
+    「看起来可写」（os.access 查的是静态权限位）就会换个随机名继续试，而上界
+    TMP_MAX 是 2147483647，等于没有上界。沙箱 / 反勒索防护这类环境恰好稳定地
+    制造出「静态权限说可写、实际创建被拒」的组合，于是调用方被永久挂住 —— 这
+    正是存储位置确认接口卡死的根因。
+
+    自建的独占创建只对文件名冲突重试，权限类错误必须立刻抛出，所以这里断言
+    os.open 只被调用了一次。
+    """
+    target = tmp_path / "state.json"
+    attempts: list[str] = []
+
+    def denied(path, flags, mode=0o777):
+        attempts.append(str(path))
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "open", denied)
+
+    with pytest.raises(PermissionError):
+        atomic_write_text(target, "v1")
+
+    assert len(attempts) == 1, "权限错误必须立刻抛出，不得换名重试"
+    assert _tmp_siblings(target) == [], "失败的创建不应留下临时文件"
+
+
+def test_temp_name_collision_exhaustion_is_bounded(tmp_path, monkeypatch):
+    """随机名连续撞车时，重试次数必须有上界。
+
+    这是本次修复的核心保障：即使每次生成的随机名都撞上已存在的文件，也只允许
+    重试 ``_TMP_CREATE_MAX_TRIES`` 次，然后抛出 FileExistsError，绝不无限循环。
+    """
+    target = tmp_path / "state.json"
+    attempts: list[str] = []
+
+    def always_exists(path, flags, mode=0o777):
+        attempts.append(str(path))
+        raise FileExistsError(17, "File exists")
+
+    monkeypatch.setattr(os, "open", always_exists)
+
+    with pytest.raises(FileExistsError):
+        atomic_write_text(target, "v1")
+
+    assert len(attempts) == file_utils._TMP_CREATE_MAX_TRIES, (
+        "撞车重试必须收敛到固定上界，不能无限重试"
+    )
+
+
 # ── Windows: the target is momentarily busy ─────────────────────────────
 
 
@@ -511,18 +565,23 @@ def test_sweep_only_touches_files_it_can_prove_it_owns(tmp_path):
 
 
 def test_the_temp_files_this_module_creates_carry_the_owner_tag(tmp_path, monkeypatch):
-    # 所有权标记只有在**创建**时也带上才有意义：只改清扫器的正则、不改 mkstemp 的
+    # 所有权标记只有在**创建**时也带上才有意义：只改清扫器的正则、不改创建端的
     # 前缀，就会变成「以后再也扫不到任何东西」的静默失效。
+    #
+    # 观察点从 tempfile.mkstemp 换到 _create_exclusive_temp_file：本模块刻意不再走
+    # mkstemp（它在 Windows 上遇到 PermissionError 会换名无限重试，见该函数 docstring），
+    # 给 mkstemp 打桩就再也看不到任何名字了。契约本身没变 —— 仍然钉「创建出来的名字
+    # 必须被清扫器的所有权正则认领」。
     target = tmp_path / "state.json"
     seen = {}
-    real_mkstemp = tempfile.mkstemp
+    real_create = file_utils._create_exclusive_temp_file
 
-    def spy(*args, **kwargs):
-        fd, path = real_mkstemp(*args, **kwargs)
+    def spy(target_dir):
+        fd, path = real_create(target_dir)
         seen["name"] = Path(path).name
         return fd, path
 
-    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    monkeypatch.setattr(file_utils, "_create_exclusive_temp_file", spy)
     atomic_write_json(target, {"v": 1})
 
     assert file_utils._STALE_TMP_RE.match(seen["name"]), (
@@ -639,15 +698,17 @@ def test_temp_name_is_a_short_constant_shape(tmp_path, monkeypatch):
     # （eCryptfs 这类只给 143 字节的文件系统也够），以及它比改动前的
     # `.<basename>.<8>.tmp` 严格更短 —— 否则原本能写的长名字目标会因为 ENAMETOOLONG
     # 写不动。顺便：不嵌 basename 不影响诊断，os.replace 失败的回显自带目标路径。
+    # 观察点同 test_the_temp_files_this_module_creates_carry_the_owner_tag：本模块
+    # 不再调用 tempfile.mkstemp，改成包住真正的创建函数来取名字。
     seen = []
-    real_mkstemp = tempfile.mkstemp
+    real_create = file_utils._create_exclusive_temp_file
 
-    def spy(*args, **kwargs):
-        fd, path = real_mkstemp(*args, **kwargs)
+    def spy(target_dir):
+        fd, path = real_create(target_dir)
         seen.append(Path(path).name)
         return fd, path
 
-    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    monkeypatch.setattr(file_utils, "_create_exclusive_temp_file", spy)
     for basename in ("s.json", "妮" * 60 + ".json"):
         atomic_write_json(tmp_path / basename, {"v": 1})
 

@@ -2316,6 +2316,7 @@
         "selectionIntroImageAlt": "Ilustração da migração de armazenamento do N.E.K.O",
         "statusUnexpected": "A API de status de manutenção do armazenamento retornou um resultado não reconhecido.",
         "storageBootstrapBlocking": "O armazenamento ainda precisa de recuperação ou migração, então esta sessão ainda não pode continuar.",
+        "storagePolicyWriteFailed": "Não foi possível gravar a configuração do local de armazenamento. O estado anterior foi restaurado; verifique se o diretório de estado local é gravável e tente novamente.",
         "targetNotEmpty": "O destino já contém dados de execução. Confirme o destino antes da migração.",
         "systemStatusUnavailable": "Não foi possível confirmar o status do serviço local. Tente novamente.",
         "systemStatusUnexpected": "A API de status de inicialização do armazenamento retornou um resultado não reconhecido.",

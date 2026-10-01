@@ -384,6 +384,8 @@
                 return translate('storage.selectionSubmitFailed', '提交存储位置选择失败，请稍后重试。');
             case 'storage_bootstrap_blocking':
                 return translate('storage.storageBootstrapBlocking', '当前存储状态仍需恢复或迁移，暂时不能继续当前会话。');
+            case 'storage_policy_write_failed':
+                return translate('storage.storagePolicyWriteFailed', '写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。');
             case 'target_confirmation_required':
                 return existingTargetConfirmationText();
             case 'target_not_empty':

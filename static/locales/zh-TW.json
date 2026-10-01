@@ -2316,6 +2316,7 @@
         "selectionIntroImageAlt": "N.E.K.O 儲存位置遷移插圖",
         "statusUnexpected": "存儲維護狀態介面返回了未識別的結果。",
         "storageBootstrapBlocking": "目前存儲狀態仍需恢復或遷移，暫時不能繼續目前會話。",
+        "storagePolicyWriteFailed": "寫入存儲位置設定失敗，已恢復原有狀態，請檢查本機狀態目錄是否可寫後重試。",
         "targetNotEmpty": "目標路徑已經包含執行時資料，請確認目標目錄後再繼續遷移。",
         "systemStatusUnavailable": "暫時無法確認本地服務狀態，請重試。",
         "systemStatusUnexpected": "存儲啟動狀態介面返回了未識別的結果。",

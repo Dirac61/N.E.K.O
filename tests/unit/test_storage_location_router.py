@@ -1474,6 +1474,174 @@ def test_storage_location_select_current_root_recovers_failed_migration_checkpoi
 
 
 @pytest.mark.unit
+def test_storage_location_select_current_root_rolls_back_when_recovery_write_fails(tmp_path, monkeypatch):
+    """恢复失败迁移检查点时写入失败，必须回滚到 pre-image 并返回新错误码。
+
+    回归点：`_recover_from_failed_migration` 是「删检查点 → 写策略 → 切 root mode」
+    三段写，改动前这三段没有 try/except。只要中间一段抛异常（最典型的就是本机状态
+    目录不可写 —— 沙箱 / 反勒索防护下的固定症状），检查点已经被删掉、策略和 root
+    mode 却还停在 deferred_init，调用方还会收到一个没有任何 error_code 的裸 500。
+    """
+    config_manager = _make_real_config_manager(tmp_path)
+    target_root = tmp_path / "target-not-empty" / "N.E.K.O"
+    create_pending_storage_migration(
+        config_manager,
+        source_root=config_manager.app_docs_dir,
+        target_root=target_root,
+        selection_source="custom",
+    )
+    save_storage_migration(
+        config_manager,
+        {
+            "status": "failed",
+            "source_root": str(config_manager.app_docs_dir),
+            "target_root": str(target_root),
+            "selection_source": "custom",
+            "error_code": "target_not_empty",
+            "error_message": "目标路径已经包含现有数据，为避免覆盖，本次迁移已停止。",
+        },
+    )
+    config_manager.save_root_state({
+        "mode": "deferred_init",
+        "current_root": str(config_manager.app_docs_dir),
+        "last_known_good_root": str(config_manager.app_docs_dir),
+        "last_migration_result": "failed:target_not_empty",
+        "last_migration_source": str(config_manager.app_docs_dir),
+    })
+    monkeypatch.setattr(
+        storage_location_bootstrap_module,
+        "DEVELOPMENT_ALWAYS_REQUIRE_SELECTION",
+        False,
+    )
+
+    # pre-image：回滚后这三份状态必须逐一还原
+    previous_migration = load_storage_migration(config_manager)
+    previous_policy = load_storage_policy(config_manager, anchor_root=config_manager.anchor_root)
+    previous_root_state = config_manager.load_root_state()
+
+    # 让三段写里的第二段（save_storage_policy）失败 —— 此时检查点已经被删掉了。
+    # 打桩只影响路由模块自己的名字：bootstrap 阶段不调用 save_storage_policy，
+    # 而回滚走的是 _restore_storage_mutation_state（直接 atomic_write_json 与
+    # save_storage_migration），不会被这个桩误伤。
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "recovered",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "storage_policy_write_failed"
+
+    # 回滚把被删掉的检查点、没写成的策略、没切的 root mode 全部还原
+    assert load_storage_migration(config_manager) == previous_migration
+    assert load_storage_policy(config_manager, anchor_root=config_manager.anchor_root) == previous_policy
+    assert config_manager.load_root_state() == previous_root_state
+
+
+@pytest.mark.unit
+def test_storage_location_select_unavailable_selected_root_rolls_back_when_recovery_write_fails(
+    tmp_path,
+    monkeypatch,
+):
+    """恢复不可用原路径时写入失败，必须回滚到 pre-image 并返回新错误码。
+
+    回归点：`_recover_from_unavailable_selected_root` 是「写策略 → 切 root mode」
+    两段写，改动前这两段是裸调用、没有 try/except。只要写入抛异常（典型场景仍是本机
+    状态目录不可写），调用方拿到的是一个没有 error_code 的裸 500，前端只能落到兜底的
+    「提交存储位置选择失败，请稍后重试。」。
+    """
+    config_manager = _make_real_config_manager(tmp_path)
+    unavailable_selected_root = tmp_path / "offline-selected" / "N.E.K.O"
+    save_storage_policy(
+        config_manager,
+        selected_root=unavailable_selected_root,
+        selection_source="custom",
+    )
+    reloaded_manager = _make_real_config_manager(tmp_path)
+    monkeypatch.setattr(
+        storage_location_bootstrap_module,
+        "DEVELOPMENT_ALWAYS_REQUIRE_SELECTION",
+        False,
+    )
+
+    # pre-image：回滚后策略与 root mode 必须逐一还原
+    previous_policy = load_storage_policy(reloaded_manager, anchor_root=reloaded_manager.anchor_root)
+    previous_root_state = reloaded_manager.load_root_state()
+
+    # 打桩只影响路由模块自己的名字：bootstrap 阶段不调用 save_storage_policy，而回滚走的是
+    # _restore_storage_mutation_state（直接 atomic_write_json 与 save_storage_migration），
+    # 不会被这个桩误伤。
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    with _build_client(reloaded_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(reloaded_manager.anchor_root),
+                "selection_source": "recommended",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "storage_policy_write_failed"
+
+    assert load_storage_policy(reloaded_manager, anchor_root=reloaded_manager.anchor_root) == previous_policy
+    assert reloaded_manager.load_root_state() == previous_root_state
+
+
+@pytest.mark.unit
+def test_storage_location_select_current_root_rolls_back_when_persist_write_fails(tmp_path, monkeypatch):
+    """普通持久化分支写入失败，必须回滚到 pre-image 并返回新错误码。
+
+    回归点：`_persist_current_root_selection` 改动前是裸调用，写入抛异常时异常会直接
+    冒出路由（调用方连 500 响应体都拿不到），前端只能显示兜底文案。补上共用 helper 后
+    应当返回带 error_code 的 500，并且不留下半个策略文件。
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+    previous_policy = load_storage_policy(config_manager)
+    previous_root_state = config_manager.load_root_state()
+
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "storage_policy_write_failed"
+
+    # 写入一行都没落地，回滚后策略文件仍应不存在，root_state 保持原样
+    assert not get_storage_policy_path(config_manager).exists()
+    assert load_storage_policy(config_manager) == previous_policy
+    assert config_manager.load_root_state() == previous_root_state
+
+
+@pytest.mark.unit
 def test_storage_location_restart_rebinds_original_root_without_creating_migration_checkpoint(tmp_path, monkeypatch):
     config_manager = _make_real_config_manager(tmp_path)
     unavailable_selected_root = tmp_path / "offline-selected" / "N.E.K.O"

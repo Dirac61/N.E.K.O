@@ -15,16 +15,20 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
+import logging
 import os
 import re
-import tempfile
+import secrets
 import threading
 import time
 import unicodedata
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 # ── LLM JSON tolerance ─────────────────────────��────────────────────────
 # LLM 经常返回带有格式瑕疵的 JSON（无引号 key、尾逗号、Python 字面值等）。
@@ -724,18 +728,78 @@ def replace_with_busy_retry(temp_path: str | os.PathLike[str], target_path: Path
     _replace_with_busy_retry(str(temp_path), target_path)
 
 
+# 临时文件的创建尝试上限。名字用 128 位随机串，撞名概率可以忽略，所以给一个小
+# 上界就够。它存在的意义不是「够不够用」，而是杜绝「无限重试」这种可能性本身。
+_TMP_CREATE_MAX_TRIES = 32
+
+# 与 tempfile.mkstemp 的默认口径保持一致：Windows 上加 O_BINARY，避免 CRT 层对
+# \r\n 做转换（文本编码由 Python 侧的 TextIOWrapper 负责，底层句柄必须保持二进制）。
+_TMP_OPEN_FLAGS = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0)
+
+
+def _create_exclusive_temp_file(target_dir: Path) -> tuple[int, str]:
+    """在目标目录里独占创建一个临时文件，返回 (fd, 绝对路径)。
+
+    刻意不用 ``tempfile.mkstemp``。它在 Windows 上有一个分支：创建文件报
+    PermissionError 时，只要目录「看起来可写」（os.access 查的是静态权限位）
+    就换个随机名字重试。而 Windows 上这个循环的上界 TMP_MAX 是 2147483647，
+    等于没有上界。
+
+    沙箱、安全软件这类环境恰好稳定地制造出「静态权限说可写、实际创建被拒」的
+    组合，于是那个分支会一直重试下去：不抛异常、不返回，整个调用方被永久挂住。
+    这正是本项目在受限环境下写盘卡死的原因。
+
+    这里只对 FileExistsError（随机名撞车）重试，其余 OSError 一律立刻抛出，
+    让调用方拿到一个诚实的异常，而不是无限等待。
+    """
+    for _ in range(_TMP_CREATE_MAX_TRIES):
+        # 随机段不含点号，符合 _STALE_TMP_RE 的形状要求，能被残留清扫器认领。
+        # 固定 8 个字符（token_hex(4)），让完整 tmp 名恒为 19 字节：与改动前
+        # tempfile.mkstemp 的 8 字符随机段等长，满足「名字是常量长度、且严格短于
+        # 旧的 .<basename>.<8>.tmp」这条契约 —— test_temp_name_is_a_short_constant_shape
+        # 钉住了它，否则原本能写的长名字目标会因 ENAMETOOLONG 写不动。
+        temp_path = target_dir / f".{_TMP_OWNER_TAG}{secrets.token_hex(4)}.tmp"
+        try:
+            # O_CREAT|O_EXCL：名字必须原本不存在才能创建成功，天然防撞车、
+            # 也防符号链接抢占。0o600 与 mkstemp 的默认权限一致。
+            fd = os.open(temp_path, _TMP_OPEN_FLAGS, 0o600)
+        except FileExistsError:
+            # 极低概率的随机名撞车：换一个名字重试，这是唯一该重试的情形。
+            continue
+        except OSError as exc:
+            # 权限拒绝、目录被删、磁盘满、路径过长……全部落到这里，直接抛出。
+            # 这里是本次修复的核心：不再重试，也就不会再出现无限循环。
+            logger.warning(
+                "[file_utils] 临时文件创建失败，本次写入放弃: dir=%s errno=%s error=%s",
+                target_dir,
+                getattr(exc, "errno", None),
+                exc,
+            )
+            raise
+        return fd, str(temp_path)
+
+    # 连续 32 次随机名全部撞车，实际不可能发生；保留这个分支是为了让函数在所有
+    # 路径上都有明确返回或抛出，而不是悄悄返回 None 让调用方解包失败。
+    logger.error(
+        "[file_utils] 连续 %s 次都无法在目标目录创建唯一临时文件: dir=%s",
+        _TMP_CREATE_MAX_TRIES,
+        target_dir,
+    )
+    raise FileExistsError(
+        errno.EEXIST,
+        f"连续 {_TMP_CREATE_MAX_TRIES} 次都无法创建唯一临时文件",
+        str(target_dir),
+    )
+
+
 def atomic_write_text(path: str | os.PathLike[str], content: str, *, encoding: str = "utf-8") -> None:
     """Atomically replace a text file in the same directory."""
     target_path = Path(path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     _sweep_stale_tmp_if_due(target_path)
 
-    fd, temp_path = tempfile.mkstemp(
-        # 前缀里带所有权标记：清扫器靠它证明这个 tmp 是本模块产的，而不是靠猜形状。
-        prefix=f".{_TMP_OWNER_TAG}",
-        suffix=".tmp",
-        dir=str(target_path.parent),
-    )
+    # 自建的独占创建（不用 tempfile.mkstemp），失败时立刻抛异常而不是无限重试。
+    fd, temp_path = _create_exclusive_temp_file(target_path.parent)
 
     try:
         with os.fdopen(fd, "w", encoding=encoding) as temp_file:
@@ -764,11 +828,8 @@ def atomic_write_bytes(path: str | os.PathLike[str], content: bytes) -> None:
     target_path.parent.mkdir(parents=True, exist_ok=True)
     _sweep_stale_tmp_if_due(target_path)
 
-    fd, temp_path = tempfile.mkstemp(
-        prefix=f".{_TMP_OWNER_TAG}",
-        suffix=".tmp",
-        dir=str(target_path.parent),
-    )
+    # 自建的独占创建（不用 tempfile.mkstemp），失败时立刻抛异常而不是无限重试。
+    fd, temp_path = _create_exclusive_temp_file(target_path.parent)
 
     try:
         with os.fdopen(fd, "wb") as temp_file:

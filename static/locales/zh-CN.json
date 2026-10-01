@@ -2316,6 +2316,7 @@
         "selectionIntroImageAlt": "N.E.K.O 存储位置迁移插图",
         "statusUnexpected": "存储维护状态接口返回了未识别的结果。",
         "storageBootstrapBlocking": "当前存储状态仍需恢复或迁移，暂时不能继续当前会话。",
+        "storagePolicyWriteFailed": "写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。",
         "targetNotEmpty": "目标路径已经包含运行时数据，请确认目标目录后再继续迁移。",
         "systemStatusUnavailable": "暂时无法确认本地服务状态，请重试。",
         "systemStatusUnexpected": "存储启动状态接口返回了未识别的结果。",

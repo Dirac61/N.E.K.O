@@ -371,6 +371,77 @@ async def _apply_storage_mutation_writes(
     return await _run_locked_storage_job(_job)
 
 
+async def _apply_storage_mutation_writes_or_rollback(
+    config_manager,
+    *,
+    anchor_root: Path,
+    snapshot_out: dict[str, Any],
+    write: Callable[[], Any],
+) -> tuple[Any, dict[str, Any] | None]:
+    """执行一次存储状态写入；失败时回滚，并给出统一的失败响应体。
+
+    返回 ``(policy_payload, write_error)``：成功时 ``write_error`` 为 None，失败时
+    ``policy_payload`` 为 None。三处「选择当前路径」的分支（恢复失败的迁移、恢复
+    不可用的原路径、普通持久化）在写入失败上的语义完全一致——都要回到 pre-image
+    并让前端看到同一个 error_code——所以快照、回滚和错误码统一收在这里，避免三处
+    各写一遍、其中两处漏掉回滚。
+
+    ``snapshot_out`` 由调用方传入并在原地填充，因为调用方随后还要拿它去
+    ``_release_storage_startup_barrier_or_rollback``：解除启动屏障失败时同样要按这份
+    pre-image 回滚。
+    """
+    try:
+        policy_payload = await _apply_storage_mutation_writes(
+            config_manager,
+            anchor_root=anchor_root,
+            snapshot_out=snapshot_out,
+            write=write,
+        )
+    except asyncio.CancelledError:
+        # 取消也必须回滚：_run_locked_storage_job 会先等 worker 跑到终态再放行取消，
+        # 所以「写策略 → 切 root mode」这一串可能已经落盘、也可能中途炸掉（worker 的
+        # 异常在取消路径上只被记日志，不会冒泡到调用方）。两种情况唯一安全的选择都是
+        # 回到 pre-image。CancelledError 是 BaseException，下面的 except Exception
+        # 接不住，所以必须单列。
+        if snapshot_out:
+            with suppress(Exception, asyncio.CancelledError):
+                await _run_locked_storage_job(
+                    partial(
+                        _restore_storage_mutation_state,
+                        config_manager,
+                        snapshot_out,
+                        anchor_root=anchor_root,
+                    )
+                )
+        raise
+    except Exception as exc:
+        # 写入失败（典型场景：本机状态目录不可写，沙箱 / 反勒索防护下的固定症状）必须
+        # 回滚，否则会留下「策略与 root mode 没跟上」的半截状态 —— 比失败本身更难收拾，
+        # 且调用方只拿到一个没有 error_code 的裸 500。空快照 = 快照都没取成、一行都没写，
+        # 跳过回滚（回滚反而会删掉盘上本来就在的检查点，见 _restore_storage_mutation_state）。
+        if snapshot_out:
+            try:
+                await _run_locked_storage_job(
+                    partial(
+                        _restore_storage_mutation_state,
+                        config_manager,
+                        snapshot_out,
+                        anchor_root=anchor_root,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "存储位置写入失败后回滚状态也失败，盘上可能残留半截状态",
+                )
+        logger.warning("[storage_location] 存储位置配置写入失败，已尝试回滚原有状态: %s", exc)
+        return None, {
+            "ok": False,
+            "error_code": "storage_policy_write_failed",
+            "error": f"写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。{exc}",
+        }
+    return policy_payload, None
+
+
 async def _release_storage_startup_barrier_or_rollback(
     config_manager,
     *,
@@ -1634,12 +1705,15 @@ async def _post_storage_location_select_locked(
                     return recovered_policy
 
                 state_snapshot: dict[str, Any] = {}
-                policy_payload = await _apply_storage_mutation_writes(
+                policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
                     config_manager,
                     anchor_root=anchor_root,
                     snapshot_out=state_snapshot,
                     write=_recover_from_failed_migration,
                 )
+                if write_error is not None:
+                    response.status_code = 500
+                    return write_error
                 try:
                     await _release_storage_startup_barrier_or_rollback(
                         config_manager,
@@ -1678,12 +1752,15 @@ async def _post_storage_location_select_locked(
                 return recovered_policy
 
             state_snapshot = {}
-            policy_payload = await _apply_storage_mutation_writes(
+            policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
                 config_manager,
                 anchor_root=anchor_root,
                 snapshot_out=state_snapshot,
                 write=_recover_from_unavailable_selected_root,
             )
+            if write_error is not None:
+                response.status_code = 500
+                return write_error
             try:
                 await _release_storage_startup_barrier_or_rollback(
                     config_manager,
@@ -1713,12 +1790,15 @@ async def _post_storage_location_select_locked(
             )
 
         state_snapshot = {}
-        policy_payload = await _apply_storage_mutation_writes(
+        policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
             config_manager,
             anchor_root=anchor_root,
             snapshot_out=state_snapshot,
             write=_persist_current_root_selection,
         )
+        if write_error is not None:
+            response.status_code = 500
+            return write_error
         try:
             await _release_storage_startup_barrier_or_rollback(
                 config_manager,
