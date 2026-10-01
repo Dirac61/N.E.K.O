@@ -728,8 +728,9 @@ def replace_with_busy_retry(temp_path: str | os.PathLike[str], target_path: Path
     _replace_with_busy_retry(str(temp_path), target_path)
 
 
-# 临时文件的创建尝试上限。名字用 128 位随机串，撞名概率可以忽略，所以给一个小
-# 上界就够。它存在的意义不是「够不够用」，而是杜绝「无限重试」这种可能性本身。
+# 临时文件的创建尝试上限。名字用 32 位随机串（token_hex(4)，即 8 个十六进制字符；
+# 位数被下面的长度契约钉死，不能随意加大），2^32 的名字空间下撞名概率可以忽略，所以
+# 给一个小上界就够。它存在的意义不是「够不够用」，而是杜绝「无限重试」这种可能性本身。
 _TMP_CREATE_MAX_TRIES = 32
 
 # 与 tempfile.mkstemp 的默认口径保持一致：Windows 上加 O_BINARY，避免 CRT 层对

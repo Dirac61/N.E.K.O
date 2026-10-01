@@ -1642,6 +1642,77 @@ def test_storage_location_select_current_root_rolls_back_when_persist_write_fail
 
 
 @pytest.mark.unit
+def test_storage_location_select_reports_rollback_failure_when_rollback_write_also_fails(tmp_path, monkeypatch):
+    """前向写入失败、回滚也失败时，必须返回不声称「已恢复」的错误码。
+
+    回归点：回滚要往同一个不可写目录里重新落盘。恢复失败的迁移分支就是现成的例子 ——
+    检查点已被 ``delete_storage_migration`` 删掉，回滚要重新写回它
+    （``save_storage_migration``），同样会被拒。改动前这里只记一条日志，仍然返回
+    ``storage_policy_write_failed`` 和「已恢复原有状态」的文案：用户会据此直接重试，
+    而盘上其实停在半截状态。所以回滚失败必须换一个不承诺恢复的错误码。
+    """
+    config_manager = _make_real_config_manager(tmp_path)
+    target_root = tmp_path / "target-not-empty" / "N.E.K.O"
+    create_pending_storage_migration(
+        config_manager,
+        source_root=config_manager.app_docs_dir,
+        target_root=target_root,
+        selection_source="custom",
+    )
+    save_storage_migration(
+        config_manager,
+        {
+            "status": "failed",
+            "source_root": str(config_manager.app_docs_dir),
+            "target_root": str(target_root),
+            "selection_source": "custom",
+            "error_code": "target_not_empty",
+            "error_message": "目标路径已经包含现有数据，为避免覆盖，本次迁移已停止。",
+        },
+    )
+    config_manager.save_root_state({
+        "mode": "deferred_init",
+        "current_root": str(config_manager.app_docs_dir),
+        "last_known_good_root": str(config_manager.app_docs_dir),
+        "last_migration_result": "failed:target_not_empty",
+        "last_migration_source": str(config_manager.app_docs_dir),
+    })
+    monkeypatch.setattr(
+        storage_location_bootstrap_module,
+        "DEVELOPMENT_ALWAYS_REQUIRE_SELECTION",
+        False,
+    )
+
+    previous_migration = load_storage_migration(config_manager)
+
+    def _deny_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    # 双重失败：前向写策略被拒，回滚要重新写回检查点时同样被拒（同一个不可写目录）
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_write)
+    monkeypatch.setattr(storage_location_router_module, "save_storage_migration", _deny_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "recovered",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    # 回滚失败时不能沿用那个声称「已恢复原有状态」的错误码
+    assert payload["error_code"] == "storage_policy_rollback_failed"
+
+    # 回滚确实没成功：检查点没被写回去，盘上并没有回到 pre-image
+    assert previous_migration
+    assert not load_storage_migration(config_manager)
+
+
+@pytest.mark.unit
 def test_storage_location_restart_rebinds_original_root_without_creating_migration_checkpoint(tmp_path, monkeypatch):
     config_manager = _make_real_config_manager(tmp_path)
     unavailable_selected_root = tmp_path / "offline-selected" / "N.E.K.O"

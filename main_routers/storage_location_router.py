@@ -419,6 +419,12 @@ async def _apply_storage_mutation_writes_or_rollback(
         # 回滚，否则会留下「策略与 root mode 没跟上」的半截状态 —— 比失败本身更难收拾，
         # 且调用方只拿到一个没有 error_code 的裸 500。空快照 = 快照都没取成、一行都没写，
         # 跳过回滚（回滚反而会删掉盘上本来就在的检查点，见 _restore_storage_mutation_state）。
+        #
+        # 回滚本身也可能失败：回滚要往同一个「不可写」的目录里重新落盘。恢复失败的迁移
+        # 分支就是现成的例子——检查点已被 delete_storage_migration 删掉，回滚要重新写回
+        # 它，同样会被拒。此时盘上并没有回到 pre-image，所以绝不能对用户声称「已恢复原有
+        # 状态」：用户会据此直接重试，而状态其实停在半截。下面按三种结局分别响应。
+        rollback_error: Exception | None = None
         if snapshot_out:
             try:
                 await _run_locked_storage_job(
@@ -429,11 +435,31 @@ async def _apply_storage_mutation_writes_or_rollback(
                         anchor_root=anchor_root,
                     )
                 )
-            except Exception:
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
                 logger.exception(
                     "存储位置写入失败后回滚状态也失败，盘上可能残留半截状态",
                 )
-        logger.warning("[storage_location] 存储位置配置写入失败，已尝试回滚原有状态: %s", exc)
+        if rollback_error is not None:
+            logger.warning(
+                "[storage_location] 存储位置配置写入失败且回滚失败，盘上状态可能未回到 pre-image: "
+                "写入异常=%s 回滚异常=%s",
+                exc,
+                rollback_error,
+            )
+            return None, {
+                "ok": False,
+                "error_code": "storage_policy_rollback_failed",
+                "error": (
+                    "写入存储位置配置失败，且未能恢复原有状态，请检查本机状态目录是否可写；"
+                    f"若仍异常请手动确认状态文件。写入异常：{exc}"
+                ),
+            }
+        logger.warning(
+            "[storage_location] 存储位置配置写入失败，%s: %s",
+            "已回滚原有状态" if snapshot_out else "未取到快照、无落盘改动，无需回滚",
+            exc,
+        )
         return None, {
             "ok": False,
             "error_code": "storage_policy_write_failed",
