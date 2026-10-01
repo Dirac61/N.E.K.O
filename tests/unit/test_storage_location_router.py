@@ -1634,6 +1634,8 @@ def test_storage_location_select_current_root_rolls_back_when_persist_write_fail
     payload = response.json()
     assert payload["ok"] is False
     assert payload["error_code"] == "storage_policy_write_failed"
+    # 响应体只给稳定文案，底层异常（含绝对路径）必须留在服务端日志里
+    assert "[Errno 13]" not in payload["error"]
 
     # 写入一行都没落地，回滚后策略文件仍应不存在，root_state 保持原样
     assert not get_storage_policy_path(config_manager).exists()
@@ -1706,10 +1708,69 @@ def test_storage_location_select_reports_rollback_failure_when_rollback_write_al
     assert payload["ok"] is False
     # 回滚失败时不能沿用那个声称「已恢复原有状态」的错误码
     assert payload["error_code"] == "storage_policy_rollback_failed"
+    # 响应体只给稳定文案，底层异常（含绝对路径）必须留在服务端日志里
+    assert "[Errno 13]" not in payload["error"]
 
     # 回滚确实没成功：检查点没被写回去，盘上并没有回到 pre-image
     assert previous_migration
     assert not load_storage_migration(config_manager)
+
+
+@pytest.mark.unit
+def test_storage_location_select_reports_snapshot_failure_without_claiming_restore(tmp_path, monkeypatch):
+    """快照没取成时，必须返回不声称「已恢复」的错误码，并且绝不能去跑回滚。
+
+    回归点：``_snapshot_storage_mutation_state`` 在写入前读取 root_state 失败时，
+    ``snapshot_out`` 保持为空、写入闭包压根不会执行（快照和写入在同一个 job 里，
+    快照在前）。改动前这条路径落到 ``storage_policy_write_failed`` + 「已恢复原有
+    状态」：既没有恢复动作，也没有确认过盘上内容——走到这里正是因为读 root_state
+    失败，而回滚成功那条路径是有肯定证据的（pre-image 重新落盘成功）。所以必须换
+    一个稳定文案。
+
+    同时，空快照下绝不能跑回滚：``_restore_storage_mutation_state`` 会把「没有
+    migration / policy 键」读成「这两个文件本来就不存在」，于是删检查点、unlink
+    策略文件，把本来好好的文件毁掉。
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+
+    def _deny_snapshot(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    rollback_calls = []
+
+    def _record_rollback(*args, **kwargs):
+        rollback_calls.append(args)
+
+    monkeypatch.setattr(
+        storage_location_router_module,
+        "_snapshot_storage_mutation_state",
+        _deny_snapshot,
+    )
+    monkeypatch.setattr(
+        storage_location_router_module,
+        "_restore_storage_mutation_state",
+        _record_rollback,
+    )
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "storage_policy_snapshot_failed"
+    # 响应体只给稳定文案，底层异常（含绝对路径）必须留在服务端日志里
+    assert "[Errno 13]" not in payload["error"]
+    # 快照都没取成，绝不能跑回滚
+    assert rollback_calls == []
+    # 写入闭包压根没执行，策略文件仍应不存在
+    assert not get_storage_policy_path(config_manager).exists()
 
 
 @pytest.mark.unit

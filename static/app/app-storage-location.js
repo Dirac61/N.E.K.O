@@ -386,6 +386,8 @@
                 return translate('storage.storageBootstrapBlocking', '当前存储状态仍需恢复或迁移，暂时不能继续当前会话。');
             case 'storage_policy_rollback_failed':
                 return translate('storage.storagePolicyRollbackFailed', '写入存储位置配置失败，且未能恢复原有状态，请检查本机状态目录是否可写；若仍异常请手动确认状态文件。');
+            case 'storage_policy_snapshot_failed':
+                return translate('storage.storagePolicySnapshotFailed', '写入存储位置配置失败，未取得状态快照、未发生落盘改动，请检查本机状态目录是否可写后重试。');
             case 'storage_policy_write_failed':
                 return translate('storage.storagePolicyWriteFailed', '写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。');
             case 'target_confirmation_required':
