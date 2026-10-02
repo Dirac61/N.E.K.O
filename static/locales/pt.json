@@ -2319,6 +2319,7 @@
         "storagePolicyRollbackFailed": "Não foi possível gravar a configuração do local de armazenamento e o estado anterior não pôde ser restaurado. Verifique se o diretório de estado local é gravável; se o problema persistir, confira manualmente os arquivos de estado.",
         "storagePolicySnapshotFailed": "Não foi possível gravar a configuração do local de armazenamento. Nenhum snapshot de estado foi obtido e nada foi gravado no disco; verifique se o diretório de estado local é gravável e tente novamente.",
         "storagePolicyWriteFailed": "Não foi possível gravar a configuração do local de armazenamento. O estado anterior foi restaurado; verifique se o diretório de estado local é gravável e tente novamente.",
+        "storageStateUnreadable": "Não foi possível gravar a configuração do local de armazenamento. O arquivo de estado não pode ser lido no momento (pode não existir ou o diretório pode estar inacessível) e nada foi gravado no disco; tente novamente mais tarde ou verifique se o diretório de estado local está acessível.",
         "targetNotEmpty": "O destino já contém dados de execução. Confirme o destino antes da migração.",
         "systemStatusUnavailable": "Não foi possível confirmar o status do serviço local. Tente novamente.",
         "systemStatusUnexpected": "A API de status de inicialização do armazenamento retornou um resultado não reconhecido.",

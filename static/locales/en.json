@@ -2319,6 +2319,7 @@
         "storagePolicyRollbackFailed": "Failed to write the storage location configuration, and the previous state could not be restored. Check that the local state directory is writable; if the problem persists, verify the state files manually.",
         "storagePolicySnapshotFailed": "Failed to write the storage location configuration. No state snapshot was taken and nothing was written to disk; check that the local state directory is writable and try again.",
         "storagePolicyWriteFailed": "Failed to write the storage location configuration. The previous state was restored; check that the local state directory is writable and try again.",
+        "storageStateUnreadable": "Failed to write the storage location configuration. The state file cannot be read right now (it may not exist, or its directory may be inaccessible) and nothing was written to disk; try again later or check whether the local state directory is accessible.",
         "targetNotEmpty": "The target already contains runtime data. Confirm the target before migration.",
         "systemStatusUnavailable": "The local service status could not be confirmed. Please try again.",
         "systemStatusUnexpected": "The storage startup status API returned an unrecognized result.",

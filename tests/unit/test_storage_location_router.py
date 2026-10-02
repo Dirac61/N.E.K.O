@@ -20,7 +20,14 @@ from utils.storage_migration import (
     run_pending_storage_migration,
     save_storage_migration,
 )
-from utils.storage_policy import get_storage_policy_path, load_storage_policy, save_storage_policy
+from utils.storage_policy import (
+    compute_anchor_root,
+    get_storage_policy_path,
+    load_storage_policy,
+    normalize_runtime_root,
+    save_storage_policy,
+)
+from utils import file_utils as file_utils_module
 from utils.file_utils import atomic_write_json
 
 
@@ -1643,15 +1650,206 @@ def test_storage_location_select_current_root_rolls_back_when_persist_write_fail
     assert config_manager.load_root_state() == previous_root_state
 
 
+def _route_anchor_root(config_manager):
+    """按路由的算法取 anchor_root，保证测试断言的就是接口真正用到的那条路径。"""
+    current_root = normalize_runtime_root(config_manager.app_docs_dir)
+    return compute_anchor_root(config_manager, current_root=current_root)
+
+
+@pytest.mark.unit
+def test_storage_location_select_keeps_corrupt_policy_bytes_after_rollback(tmp_path, monkeypatch):
+    """policy 存在但内容损坏时，回滚必须逐字节还回去，绝不能把它删掉。
+
+    回归点：``load_storage_policy`` 把「读取失败」和「文件不存在」都折叠成 None，
+    于是 ``_restore_storage_mutation_state`` 会把这份损坏文件 unlink 掉，还返回
+    「已恢复原有状态」—— 用户丢掉的是一份本来还能人工抢救的状态文件。改成字节
+    pre-image 之后，回滚只照抄字节。
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+    policy_path = get_storage_policy_path(config_manager, anchor_root=_route_anchor_root(config_manager))
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b'{"selected_root": "D:\\\\half-writ'  # 写到一半被截断的 JSON
+    policy_path.write_bytes(corrupt_bytes)
+
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["error_code"] == "storage_policy_write_failed"
+    # 盘上必须还是那份损坏内容：旧实现会把它 unlink 掉
+    assert policy_path.read_bytes() == corrupt_bytes
+
+
+@pytest.mark.unit
+def test_storage_location_select_keeps_corrupt_migration_bytes_after_rollback(tmp_path, monkeypatch):
+    """migration 检查点损坏时同样必须逐字节还原，不能被回滚删除。"""
+    config_manager = _DummyConfigManager(tmp_path)
+    migration_path = get_storage_migration_path(config_manager, anchor_root=_route_anchor_root(config_manager))
+    migration_path.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b'{"status": "copying"'  # 截断的检查点
+    migration_path.write_bytes(corrupt_bytes)
+
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    assert response.json()["error_code"] == "storage_policy_write_failed"
+    assert migration_path.read_bytes() == corrupt_bytes
+
+
+@pytest.mark.unit
+def test_storage_location_select_reports_unreadable_policy_state(tmp_path, monkeypatch):
+    """状态文件存在但读不出字节时：换错误码，且一行都不许落盘。
+
+    用「路径其实是个目录」构造真实的读失败（Windows 报 PermissionError、POSIX 报
+    IsADirectoryError，都是 OSError），不靠 monkeypatch 读取函数本身。
+
+    回归点：旧实现把这种情况读成 None（等于「文件不存在」），回滚会把这份状态
+    unlink 掉。字节 pre-image 之后，快照阶段就停下：write() 一行不跑，也没人去动它。
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+    policy_path = get_storage_policy_path(config_manager, anchor_root=_route_anchor_root(config_manager))
+    policy_path.mkdir(parents=True, exist_ok=True)
+
+    write_calls = []
+
+    def _record_policy_write(*args, **kwargs):
+        write_calls.append(args)
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _record_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["ok"] is False
+    assert payload["error_code"] == "storage_state_unreadable"
+    # 响应体只给稳定文案，底层异常（含绝对路径）必须留在服务端日志里
+    assert "[Errno" not in payload["error"]
+    # 快照阶段就失败：写入闭包一行都没跑，那个路径（目录）也还留在原地
+    assert write_calls == []
+    assert policy_path.is_dir()
+
+
+@pytest.mark.unit
+def test_storage_location_select_reports_unreadable_migration_state(tmp_path, monkeypatch):
+    """migration 检查点读不出字节时，同样换错误码且不落盘。"""
+    config_manager = _DummyConfigManager(tmp_path)
+    migration_path = get_storage_migration_path(config_manager, anchor_root=_route_anchor_root(config_manager))
+    migration_path.mkdir(parents=True, exist_ok=True)
+
+    write_calls = []
+
+    def _record_policy_write(*args, **kwargs):
+        write_calls.append(args)
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _record_policy_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload["error_code"] == "storage_state_unreadable"
+    assert write_calls == []
+    assert migration_path.is_dir()
+
+
+@pytest.mark.unit
+def test_storage_location_select_reports_recovered_when_rollback_has_nothing_to_write(tmp_path, monkeypatch):
+    """写入一步都没成功时，回滚不该去写，也不该报「未能恢复原有状态」。
+
+    回归点：旧实现只能在「回滚抛异常」和「回滚成功」之间二选一。而「写入第一步就被拒」
+    时盘上仍是 pre-image —— 回滚本无需写任何东西，却会照着快照重写一遍、再被同一个
+    不可写目录拒绝，于是误报「未能恢复原有状态」，让用户去修一个根本没坏的目录。
+    改成「盘上已等于 pre-image 就跳过写入」之后，回滚不写就不可能失败，如实报已恢复。
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+    anchor_root = _route_anchor_root(config_manager)
+    policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    original_policy = b'{"version": 1, "selected_root": "D:/N.E.K.O"}'
+    policy_path.write_bytes(original_policy)
+
+    byte_write_calls: list = []
+
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    def _record_byte_write(path, *args, **kwargs):
+        # 回滚一旦真的去写就会被记下来；跳过的实现下这里应该一次都不被调用
+        byte_write_calls.append(path)
+        raise PermissionError(13, "Permission denied")
+
+    # 前向写策略被拒（写入的第一步就失败）；回滚若真去写，同一个不可写目录也会拒绝
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+    monkeypatch.setattr(file_utils_module, "atomic_write_bytes", _record_byte_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    # 盘上一字未改，回滚确实成功了，文案必须如实说「已恢复」，而不是「未能恢复」
+    assert payload["error_code"] == "storage_policy_write_failed"
+    assert "已恢复原有状态" in payload["error"]
+    # 跳过生效：回滚没有尝试任何写入
+    assert byte_write_calls == []
+    # 盘上还是那份 pre-image
+    assert policy_path.read_bytes() == original_policy
+
+
 @pytest.mark.unit
 def test_storage_location_select_reports_rollback_failure_when_rollback_write_also_fails(tmp_path, monkeypatch):
     """前向写入失败、回滚也失败时，必须返回不声称「已恢复」的错误码。
 
     回归点：回滚要往同一个不可写目录里重新落盘。恢复失败的迁移分支就是现成的例子 ——
-    检查点已被 ``delete_storage_migration`` 删掉，回滚要重新写回它
-    （``save_storage_migration``），同样会被拒。改动前这里只记一条日志，仍然返回
-    ``storage_policy_write_failed`` 和「已恢复原有状态」的文案：用户会据此直接重试，
-    而盘上其实停在半截状态。所以回滚失败必须换一个不承诺恢复的错误码。
+    检查点已被 ``delete_storage_migration`` 删掉，回滚要重新写回它，同样会被拒。
+    改动前这里只记一条日志，仍然返回 ``storage_policy_write_failed`` 和「已恢复原有
+    状态」的文案：用户会据此直接重试，而盘上其实停在半截状态。所以回滚失败必须换一个
+    不承诺恢复的错误码。
     """
     config_manager = _make_real_config_manager(tmp_path)
     target_root = tmp_path / "target-not-empty" / "N.E.K.O"
@@ -1690,9 +1888,11 @@ def test_storage_location_select_reports_rollback_failure_when_rollback_write_al
     def _deny_write(*args, **kwargs):
         raise PermissionError(13, "Permission denied")
 
-    # 双重失败：前向写策略被拒，回滚要重新写回检查点时同样被拒（同一个不可写目录）
+    # 双重失败：前向写策略被拒；回滚改成按 pre-image 原始字节还原之后，要构造"回滚也
+    # 写不进去"就得拦那条真实落盘路径（atomic_write_bytes），拦 save_storage_migration
+    # 已经拦不住它了（回滚不再经过 save_* 这两个 helper）。
     monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_write)
-    monkeypatch.setattr(storage_location_router_module, "save_storage_migration", _deny_write)
+    monkeypatch.setattr(file_utils_module, "atomic_write_bytes", _deny_write)
 
     with _build_client(config_manager) as client:
         response = client.post(

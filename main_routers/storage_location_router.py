@@ -68,6 +68,7 @@ from utils.storage_migration import (
     STORAGE_MIGRATION_STATUS_FAILED,
     create_pending_storage_migration,
     delete_storage_migration,
+    get_storage_migration_path,
     is_retained_root_cleanup_available,
     load_storage_migration,
     save_storage_migration,
@@ -217,12 +218,110 @@ def _get_storage_config_manager():
         return get_runtime_config_manager(APP_NAME, migrate=False)
 
 
+class _StorageStateUnreadable(RuntimeError):
+    """状态文件当前读不出原始字节（权限拒绝、被占用、不是文件、目录不可访问、I/O 错误）。
+
+    刻意与「文件不存在」分开：只有 ``FileNotFoundError`` 能证明「不存在」，其余读取失败
+    都无法确认文件到底在不在。把这一类和「不存在」混成同一个值，回滚就会把一份只是暂时
+    读不到的状态文件 unlink 掉 —— 那正是本次要修的丢数据问题。
+    """
+
+    def __init__(self, path: Path, cause: BaseException):
+        super().__init__(f"storage state file cannot be read (existence unknown): {path}")
+        self.path = Path(path)
+        self.cause = cause
+
+
+def _read_state_file_preimage(path: Path) -> dict[str, Any]:
+    """读取一个状态文件的回滚 pre-image：本来是否存在 + 原始字节。
+
+    判定只有一条规则：``FileNotFoundError`` 才算「本来不存在」（回滚时删除）；其余
+    任何读取失败都只说明「读不出、是否还存在无法确认」，抛 ``_StorageStateUnreadable``
+    让整次写入在快照阶段就停下 —— 快照与 write() 同在一个 job，抛异常时 write() 一行都不会执行。
+
+    刻意绕开 ``load_storage_policy`` / ``load_storage_migration``：那两个加载器把
+    「不存在」和「读不出来」都折叠成 None。也刻意只存字节、不解析内容：JSON 已损坏的
+    文件同样要能逐字节还原，重新序列化会把 pre-image 的格式改掉。
+    """
+    try:
+        return {"existed": True, "bytes": Path(path).read_bytes()}
+    except FileNotFoundError:
+        return {"existed": False, "bytes": None}
+    except OSError as exc:
+        raise _StorageStateUnreadable(path, exc) from exc
+
+
 def _snapshot_storage_mutation_state(config_manager, *, anchor_root: Path) -> dict[str, Any]:
+    policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
+    migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
+
+    # root_state 先读，且保持原样：它走 ConfigManager 的严格加载器，读失败会抛，
+    # 快照整体失败、write() 一行不跑（与现状一致）。它不做字节化的原因见 PR 说明 ——
+    # 回滚要写回「原路径不可用」覆盖后的合成状态，与字节还原语义冲突，需单独定调。
+    root_state = config_manager.load_root_state()
+
+    # policy / migration 单独读字节做 pre-image，并保留原解析结果供既有调用方使用。
+    policy_preimage = _read_state_file_preimage(policy_path)
+    migration_preimage = _read_state_file_preimage(migration_path)
+    policy_payload = load_storage_policy(config_manager, anchor_root=anchor_root)
+    migration_payload = load_storage_migration(config_manager, anchor_root=anchor_root)
+
+    # 存在却解析不出对象（非法 JSON、合法 JSON 但非对象）：按原始字节纳入快照，不做修复。
+    # 写入成功时新内容会自然覆盖它；写入失败时回滚只照抄字节，损坏内容原样留下。
+    for label, state_path, preimage, payload in (
+        ("storage_policy", policy_path, policy_preimage, policy_payload),
+        ("storage_migration", migration_path, migration_preimage, migration_payload),
+    ):
+        if preimage.get("existed") and not isinstance(payload, dict):
+            logger.warning(
+                "[storage_location] %s 存在但内容无法解析为对象，回滚快照按原始字节保存（不做修复）: %s",
+                label,
+                state_path,
+            )
+
     return {
-        "root_state": config_manager.load_root_state(),
-        "policy": load_storage_policy(config_manager, anchor_root=anchor_root),
-        "migration": load_storage_migration(config_manager, anchor_root=anchor_root),
+        "root_state": root_state,
+        "policy": policy_payload,
+        "migration": migration_payload,
+        "policy_preimage": policy_preimage,
+        "migration_preimage": migration_preimage,
     }
+
+
+def _restore_state_file_from_preimage(path: Path, preimage: dict[str, Any]) -> None:
+    """按 pre-image 还原因一个状态文件：本来存在就照抄原始字节，本来不存在才删除。
+
+    只有快照明确记着「原本不存在」才允许 unlink。「读不出」的文件根本走不到这里
+    （快照阶段已经抛 ``_StorageStateUnreadable`` 停下），所以这里不会误删读不到的文件。
+    """
+    if preimage.get("existed"):
+        raw = preimage.get("bytes")
+        if raw is None:
+            # 构造上不该出现（existed=True 必带 bytes）。宁可抛也不静默跳过：跳过会让
+            # 回滚假装成功，把一个半还原的状态留给调用方。
+            raise RuntimeError("storage state pre-image exists but carries no bytes")
+        # 盘上已经是 pre-image 就跳过写入：说明这个文件从未被改动（写入一步都没成功），
+        # 或已被前面的回滚步骤退回。不写就不可能失败，于是「写入第一步就失败」这种情况
+        # 能如实判成回滚成功，不会误报「未能恢复原有状态」。比较原始字节，不解析内容。
+        try:
+            if Path(path).read_bytes() == raw:
+                logger.info("[storage_location] 状态文件已是快照内容，跳过回滚写入: %s", path)
+                return
+        except FileNotFoundError:
+            # 当前不存在（被删过）→ 必须写回
+            pass
+        except OSError:
+            # 读不出当前内容，无法确认是否已恢复 → 不跳过，交给下面的写入去尝试
+            pass
+        # 局部导入，和本文件既有的原子写导入保持一致
+        from utils.file_utils import atomic_write_bytes
+
+        atomic_write_bytes(path, raw)
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
 
 
 def _restore_storage_mutation_state(
@@ -240,22 +339,37 @@ def _restore_storage_mutation_state(
     """
     # ⚠️ 空快照绝不能往下走。下面的分支把"没有 migration / policy 键"读作"这两个文件
     # 本来就不存在"，于是删检查点、unlink 策略文件。而快照一旦真的取到，
-    # _snapshot_storage_mutation_state 必定三个键齐全（值可以是 None）——所以
+    # _snapshot_storage_mutation_state 必定三组键齐全（值可以是 None）——所以
     # 「空 dict」只可能意味着快照压根没取成（例如 load_root_state 撞上 I/O 错误），
     # 这时候没有任何写发生过，回滚只会毁掉本来好好的文件。
+    #
+    # 另外：带 policy_preimage / migration_preimage 时一律按原始字节还原，「本来不存在」
+    # 由 pre-image 里的 existed=False 表达；三个解析键只服务没有 pre-image 的旧快照。
     if not snapshot:
         logger.warning("skipping storage mutation rollback: snapshot was never taken")
         return
 
+    # 迁移检查点：有新快照的字节 pre-image 就照抄字节（损坏的检查点也要能逐字节还回去），
+    # 「读不出来」的文件到不了这里——快照阶段已终止。
+    migration_preimage = snapshot.get("migration_preimage")
     previous_migration = snapshot.get("migration")
-    if isinstance(previous_migration, dict):
+    if isinstance(migration_preimage, dict):
+        _restore_state_file_from_preimage(
+            get_storage_migration_path(config_manager, anchor_root=anchor_root),
+            migration_preimage,
+        )
+    elif isinstance(previous_migration, dict):
         save_storage_migration(config_manager, previous_migration, anchor_root=anchor_root)
     else:
         delete_storage_migration(config_manager, anchor_root=anchor_root)
 
     policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
+    policy_preimage = snapshot.get("policy_preimage")
     previous_policy = snapshot.get("policy")
-    if isinstance(previous_policy, dict):
+    if isinstance(policy_preimage, dict):
+        # 字节还原：不重新序列化，pre-image 的格式与内容逐字节保持原样（含损坏内容）
+        _restore_state_file_from_preimage(policy_path, policy_preimage)
+    elif isinstance(previous_policy, dict):
         from utils.file_utils import atomic_write_json
 
         atomic_write_json(policy_path, previous_policy, ensure_ascii=False, indent=2)
@@ -267,7 +381,18 @@ def _restore_storage_mutation_state(
 
     previous_root_state = snapshot.get("root_state")
     if isinstance(previous_root_state, dict):
-        config_manager.save_root_state(previous_root_state)
+        # root_state 不做字节快照（回滚要写回的是「原路径不可用」覆盖后的合成状态），
+        # 改用加载值比较：盘上已是快照里的值就跳过写入，理由同
+        # _restore_state_file_from_preimage —— 不写就不可能失败。
+        try:
+            current_root_state = config_manager.load_root_state()
+        except Exception:
+            # 读不出来就无法确认是否已恢复 → 不跳过，照常写回（写不动时仍会抛）
+            current_root_state = None
+        if current_root_state == previous_root_state:
+            logger.info("[storage_location] root_state 已是快照内容，跳过回滚写入")
+        else:
+            config_manager.save_root_state(previous_root_state)
 
 
 def _restore_restart_schedule_state(
@@ -418,16 +543,33 @@ async def _apply_storage_mutation_writes_or_rollback(
                     )
                 )
         raise
+    except _StorageStateUnreadable as exc:
+        # 状态文件当前读不出原始字节（权限拒绝、被别的进程占用、路径是目录、目录不可访问、I/O 错误）。
+        # 只有 FileNotFoundError 才算「不存在」，所以这里无法确认文件到底在不在。
+        # 快照阶段就终止了：write() 一行都没跑，盘上内容与请求前完全一致。所以这里既不回滚、
+        # 也不能说「已恢复」—— 只需如实告诉用户「读不出来、是否还存在无法确认」。
+        # 改动前这种文件会被宽容加载器折叠成 None（当作「不存在」），回滚顺手把它 unlink 掉：
+        # 一份只是暂时读不到的状态文件被永久删除。所以它必须有自己的错误码。
+        logger.warning(
+            "[storage_location] 存储位置配置未写入：状态文件读不出来（是否还存在无法确认），已放弃本次落盘: %s",
+            exc.path,
+        )
+        return None, {
+            "ok": False,
+            "error_code": "storage_state_unreadable",
+            "error": "写入存储位置配置失败：状态文件当前无法读取（可能不存在，或所在目录不可访问），未发生落盘改动，请稍后重试或检查本机状态目录是否可访问。",
+        }
     except Exception as exc:
         # 写入失败（典型场景：本机状态目录不可写，沙箱 / 反勒索防护下的固定症状）必须
         # 回滚，否则会留下「策略与 root mode 没跟上」的半截状态 —— 比失败本身更难收拾，
         # 且调用方只拿到一个没有 error_code 的裸 500。
         #
-        # 三种失败结局的盘上状态各不相同，绝不能共用一句「已恢复原有状态」：
-        #   1) 快照没取成 → write() 一行都没跑，盘上就是 pre-image；
-        #   2) 回滚成功   → 盘上被改过，又退回了 pre-image；
-        #   3) 回滚失败   → 盘上可能停在半截。
-        # 前端只按 error_code 取固定文案、不读响应体里的 error，所以三种结局必须各有
+        # 四种失败结局的盘上状态各不相同，绝不能共用一句「已恢复原有状态」：
+        #   1) 快照读到不可读的状态文件 → write() 一行都没跑（见上面那个分支）；
+        #   2) 快照没取成              → write() 一行都没跑，盘上就是 pre-image；
+        #   3) 回滚成功                → 盘上被改过，又退回了 pre-image；
+        #   4) 回滚失败                → 盘上可能停在半截。
+        # 前端只按 error_code 取固定文案、不读响应体里的 error，所以四种结局必须各有
         # 一个错误码，否则用户会据此误判能不能直接重试。
         if not snapshot_out:
             # 空快照 = 快照都没取成、一行都没写，跳过回滚（回滚反而会删掉盘上本来就在的

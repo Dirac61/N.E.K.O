@@ -390,6 +390,8 @@
                 return translate('storage.storagePolicySnapshotFailed', '写入存储位置配置失败，未取得状态快照、未发生落盘改动，请检查本机状态目录是否可写后重试。');
             case 'storage_policy_write_failed':
                 return translate('storage.storagePolicyWriteFailed', '写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。');
+            case 'storage_state_unreadable':
+                return translate('storage.storageStateUnreadable', '写入存储位置配置失败：状态文件当前无法读取（可能不存在，或所在目录不可访问），未发生落盘改动，请稍后重试或检查本机状态目录是否可访问。');
             case 'target_confirmation_required':
                 return existingTargetConfirmationText();
             case 'target_not_empty':
