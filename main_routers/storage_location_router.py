@@ -219,11 +219,14 @@ def _get_storage_config_manager():
 
 
 class _StorageStateUnreadable(RuntimeError):
-    """状态文件当前读不出原始字节（权限拒绝、被占用、不是文件、目录不可访问、I/O 错误）。
+    """The state file's raw bytes cannot be read right now.
 
-    刻意与「文件不存在」分开：只有 ``FileNotFoundError`` 能证明「不存在」，其余读取失败
-    都无法确认文件到底在不在。把这一类和「不存在」混成同一个值，回滚就会把一份只是暂时
-    读不到的状态文件 unlink 掉 —— 那正是本次要修的丢数据问题。
+    Deliberately kept apart from "the file does not exist": only
+    ``FileNotFoundError`` proves absence, while every other read failure leaves
+    existence unknown. Folding this class into "absent" makes the rollback
+    unlink a state file that was merely unreadable for a moment -- the exact
+    data loss this change fixes. Covers permission denied, file in use, path is
+    a directory, unreachable directory and I/O errors.
     """
 
     def __init__(self, path: Path, cause: BaseException):
@@ -232,16 +235,46 @@ class _StorageStateUnreadable(RuntimeError):
         self.cause = cause
 
 
+class _StorageRollbackPartialError(RuntimeError):
+    """At least one rollback step failed, but the rest may have succeeded.
+
+    ``_restore_storage_mutation_state`` is best-effort: the three state files
+    (migration, policy, root_state) are restored independently, and a failing
+    step does not stop the later ones. Once all three have run, this exception
+    is raised whenever ``failures`` is non-empty, carrying the
+    ``(step, path, exception)`` triple of every failed step for the caller's
+    logging and error-code branch.
+
+    Deliberately not fail-fast: when the migration checkpoint fails to restore,
+    the policy file and root_state must still be pushed back to their
+    pre-images -- "checkpoint not restored, policy left at the new value" is a
+    worse half-state than "every step was attempted".
+    """
+
+    def __init__(self, failures: list[tuple[str, Path, BaseException]]):
+        # failures 至少有一个元素；取第一个拼主消息，完整列表留在 self.failures 里供日志使用
+        first_step, first_path, first_exc = failures[0]
+        super().__init__(
+            f"storage mutation rollback partially failed ({len(failures)} step(s)); "
+            f"first: {first_step} @ {first_path}: {first_exc}"
+        )
+        self.failures = failures
+
+
 def _read_state_file_preimage(path: Path) -> dict[str, Any]:
-    """读取一个状态文件的回滚 pre-image：本来是否存在 + 原始字节。
+    """Read one state file's rollback pre-image: whether it existed plus its raw bytes.
 
-    判定只有一条规则：``FileNotFoundError`` 才算「本来不存在」（回滚时删除）；其余
-    任何读取失败都只说明「读不出、是否还存在无法确认」，抛 ``_StorageStateUnreadable``
-    让整次写入在快照阶段就停下 —— 快照与 write() 同在一个 job，抛异常时 write() 一行都不会执行。
+    A single rule decides existence: only ``FileNotFoundError`` means "did not
+    exist" (so the rollback may delete it). Any other read failure only proves
+    "cannot be read, existence unknown" and raises ``_StorageStateUnreadable``,
+    stopping the whole write during the snapshot phase -- the snapshot and
+    write() share one job, so write() never runs a single line.
 
-    刻意绕开 ``load_storage_policy`` / ``load_storage_migration``：那两个加载器把
-    「不存在」和「读不出来」都折叠成 None。也刻意只存字节、不解析内容：JSON 已损坏的
-    文件同样要能逐字节还原，重新序列化会把 pre-image 的格式改掉。
+    Deliberately bypasses ``load_storage_policy`` / ``load_storage_migration``:
+    both fold "absent" and "unreadable" into None. Also stores bytes without
+    parsing on purpose: a JSON file that is already corrupt must still be
+    replayed byte-for-byte, and re-serializing would change the pre-image's
+    formatting.
     """
     try:
         return {"existed": True, "bytes": Path(path).read_bytes()}
@@ -289,10 +322,12 @@ def _snapshot_storage_mutation_state(config_manager, *, anchor_root: Path) -> di
 
 
 def _restore_state_file_from_preimage(path: Path, preimage: dict[str, Any]) -> None:
-    """按 pre-image 还原因一个状态文件：本来存在就照抄原始字节，本来不存在才删除。
+    """Restore one state file from its pre-image: replay the bytes if it existed, delete it if it did not.
 
-    只有快照明确记着「原本不存在」才允许 unlink。「读不出」的文件根本走不到这里
-    （快照阶段已经抛 ``_StorageStateUnreadable`` 停下），所以这里不会误删读不到的文件。
+    Only a snapshot that explicitly recorded "did not exist" may unlink.
+    Unreadable files never reach this function -- the snapshot phase already
+    stopped on ``_StorageStateUnreadable`` -- so a file that merely cannot be
+    read is never deleted here.
     """
     if preimage.get("existed"):
         raw = preimage.get("bytes")
@@ -332,6 +367,16 @@ def _restore_storage_mutation_state(
 ) -> None:
     """Roll three storage state files back to a snapshot synchronously.
 
+    Best-effort: migration / policy / root_state are each restored on their own,
+    and a failing step does not stop the later ones. Once all three have run,
+    any failure raises ``_StorageRollbackPartialError`` carrying the
+    ``(step, path, exception)`` triple of every failed step.
+
+    Deliberately not fail-fast: when the migration checkpoint fails to restore,
+    the policy file and root_state must still be pushed back to their
+    pre-images -- "checkpoint not restored, policy left at the new value" is a
+    worse half-state than "every step was attempted".
+
     Keeping all three writes in one synchronous callable makes the sequence
     indivisible. Async callers submit the whole callable through
     ``_run_locked_storage_job``, which waits for the worker to finish before it
@@ -349,50 +394,85 @@ def _restore_storage_mutation_state(
         logger.warning("skipping storage mutation rollback: snapshot was never taken")
         return
 
-    # 迁移检查点：有新快照的字节 pre-image 就照抄字节（损坏的检查点也要能逐字节还回去），
+    failures: list[tuple[str, Path, BaseException]] = []
+
+    # ---- 第一步：迁移检查点 ----
+    # 有新快照的字节 pre-image 就照抄字节（损坏的检查点也要能逐字节还回去），
     # 「读不出来」的文件到不了这里——快照阶段已终止。
+    migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
     migration_preimage = snapshot.get("migration_preimage")
     previous_migration = snapshot.get("migration")
-    if isinstance(migration_preimage, dict):
-        _restore_state_file_from_preimage(
-            get_storage_migration_path(config_manager, anchor_root=anchor_root),
-            migration_preimage,
+    try:
+        if isinstance(migration_preimage, dict):
+            _restore_state_file_from_preimage(migration_path, migration_preimage)
+        elif isinstance(previous_migration, dict):
+            save_storage_migration(config_manager, previous_migration, anchor_root=anchor_root)
+        else:
+            delete_storage_migration(config_manager, anchor_root=anchor_root)
+    except Exception as exc:
+        # 单步失败不中断：policy 和 root_state 仍然要尽力还原
+        logger.exception(
+            "[storage_location] 回滚迁移检查点失败，继续尝试还原其余状态文件: %s",
+            migration_path,
         )
-    elif isinstance(previous_migration, dict):
-        save_storage_migration(config_manager, previous_migration, anchor_root=anchor_root)
-    else:
-        delete_storage_migration(config_manager, anchor_root=anchor_root)
+        failures.append(("migration", Path(migration_path), exc))
 
+    # ---- 第二步：策略文件 ----
     policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
     policy_preimage = snapshot.get("policy_preimage")
     previous_policy = snapshot.get("policy")
-    if isinstance(policy_preimage, dict):
-        # 字节还原：不重新序列化，pre-image 的格式与内容逐字节保持原样（含损坏内容）
-        _restore_state_file_from_preimage(policy_path, policy_preimage)
-    elif isinstance(previous_policy, dict):
-        from utils.file_utils import atomic_write_json
+    try:
+        if isinstance(policy_preimage, dict):
+            # 字节还原：不重新序列化，pre-image 的格式与内容逐字节保持原样（含损坏内容）
+            _restore_state_file_from_preimage(policy_path, policy_preimage)
+        elif isinstance(previous_policy, dict):
+            from utils.file_utils import atomic_write_json
 
-        atomic_write_json(policy_path, previous_policy, ensure_ascii=False, indent=2)
-    else:
-        try:
-            os.unlink(policy_path)
-        except FileNotFoundError:
-            pass
+            atomic_write_json(policy_path, previous_policy, ensure_ascii=False, indent=2)
+        else:
+            try:
+                os.unlink(policy_path)
+            except FileNotFoundError:
+                pass
+    except Exception as exc:
+        logger.exception(
+            "[storage_location] 回滚策略文件失败，继续尝试还原 root_state: %s",
+            policy_path,
+        )
+        failures.append(("policy", Path(policy_path), exc))
 
+    # ---- 第三步：root_state ----
     previous_root_state = snapshot.get("root_state")
     if isinstance(previous_root_state, dict):
         # root_state 不做字节快照（回滚要写回的是「原路径不可用」覆盖后的合成状态），
         # 改用加载值比较：盘上已是快照里的值就跳过写入，理由同
         # _restore_state_file_from_preimage —— 不写就不可能失败。
+        # 读—改—写必须整段进 root_state_transaction()：只让 save_root_state 内部那把
+        # 锁是不够的，读和写之间第三方可能插入，把 pre-image 改了之后被我们整份盖掉。
+        # 本函数通常由 _job 在事务内调用（重入锁，安全），但也可能被屏障释放路径单独
+        # 调用，所以这里也要显式取锁。
+        root_state_path = Path(getattr(config_manager, "root_state_path", ""))
         try:
-            current_root_state = config_manager.load_root_state()
-        except Exception:
-            # 读不出来就无法确认是否已恢复 → 不跳过，照常写回（写不动时仍会抛）
-            current_root_state = None
-        if current_root_state == previous_root_state:
-            logger.info("[storage_location] root_state 已是快照内容，跳过回滚写入")
-        else:
-            config_manager.save_root_state(previous_root_state)
+            with root_state_transaction():
+                try:
+                    current_root_state = config_manager.load_root_state()
+                except Exception:
+                    # 读不出来就无法确认是否已恢复 → 不跳过，照常写回（写不动时仍会抛）
+                    current_root_state = None
+                if current_root_state == previous_root_state:
+                    logger.info("[storage_location] root_state 已是快照内容，跳过回滚写入")
+                else:
+                    config_manager.save_root_state(previous_root_state)
+        except Exception as exc:
+            logger.exception(
+                "[storage_location] 回滚 root_state 失败: %s",
+                root_state_path,
+            )
+            failures.append(("root_state", root_state_path, exc))
+
+    # 三步全部跑完后，只要有任意一步失败就抛聚合异常；全成功则静默返回
+    if failures:
+        raise _StorageRollbackPartialError(failures)
 
 
 def _restore_restart_schedule_state(
@@ -485,13 +565,39 @@ async def _apply_storage_mutation_writes(
     """
 
     def _job() -> Any:
-        # The rollback pre-image and the mutation must observe one root-state
-        # transaction. In particular, do not snapshot the temporary mode held
-        # by cloud_apply_fence and then replay it after that fence has exited.
+        # 快照、写入、回滚必须在同一个 root_state_transaction() 内完成。
+        # 原来的做法是「快照+写入」在一个事务，回滚在另一个 job 里重新取锁——两个事务
+        # 之间的窗口会让第三方（cloudsave fence、跨进程 launcher 等）把 root_state 改
+        # 成新值，然后回滚用整份旧快照把人家的改动整份盖掉。把回滚搬进同一个事务后，
+        # write() 失败的常见路径从头到尾不释放锁，第三方零机会插入。
+        #
+        # 另一个原因：不要在 cloud_apply_fence 持有的临时 mode 下拍快照然后在 fence
+        # 退出后回放——快照必须和写入在同一事务里。
         with root_state_transaction():
             snapshot_out.clear()
             snapshot_out.update(_snapshot_storage_mutation_state(config_manager, anchor_root=anchor_root))
-            return write()
+            # 快照阶段可能抛 _StorageStateUnreadable：此时 write() 一行都没跑，
+            # 外层 except _StorageStateUnreadable 分支负责处理，不进下面的 try。
+            try:
+                result = write()
+            except Exception:
+                # write() 抛异常 → 在同一把锁内立即回滚，消除第三方插入窗口
+                try:
+                    _restore_storage_mutation_state(
+                        config_manager,
+                        snapshot_out,
+                        anchor_root=anchor_root,
+                    )
+                    snapshot_out["_write_outcome"] = "rolled_back"
+                except Exception as rollback_exc:
+                    # 回滚自身也失败（best-effort 下至少一步失败）→ 记录结果与异常，
+                    # 由外层 except 分支根据 _write_outcome 判定错误码
+                    snapshot_out["_write_outcome"] = "rollback_failed"
+                    snapshot_out["_rollback_error"] = rollback_exc
+                # 重新抛出 write() 的原始异常，让外层 except 分支走错误码判定
+                raise
+            snapshot_out["_write_outcome"] = "success"
+            return result
 
     return await _run_locked_storage_job(_job)
 
@@ -503,21 +609,26 @@ async def _apply_storage_mutation_writes_or_rollback(
     snapshot_out: dict[str, Any],
     write: Callable[[], Any],
 ) -> tuple[Any, dict[str, Any] | None]:
-    """执行一次存储状态写入；失败时回滚，并给出统一的失败响应体。
+    """Run one storage-state write; on failure roll back and return the shared failure body.
 
-    返回 ``(policy_payload, write_error)``：成功时 ``write_error`` 为 None，失败时
-    ``policy_payload`` 为 None。三处「选择当前路径」的分支（恢复失败的迁移、恢复
-    不可用的原路径、普通持久化）在写入失败上的语义完全一致——都要按同一条规则回到
-    pre-image、并按同一条规则挑错误码——所以快照、回滚和错误码统一收在这里，避免
-    三处各写一遍、其中两处漏掉回滚。
+    Returns ``(policy_payload, write_error)``: on success ``write_error`` is
+    None, on failure ``policy_payload`` is None. The three "select the current
+    root" branches (recovering a failed migration, recovering an unavailable
+    previous root, plain persistence) share identical write-failure semantics
+    -- go back to the pre-image by the same rule and pick the error code by the
+    same rule -- so the snapshot, the rollback and the error codes all live here
+    instead of being written out three times, with two of them missing the
+    rollback.
 
-    失败响应体只给稳定的用户安全文案，完整异常一律留在服务端日志里：前端按
-    ``error_code`` 取 i18n 固定文案，本来就不读 ``error`` 字段，把 ``exc`` 拼进去
-    只会让绝对路径和状态文件名随 API 响应外泄。
+    The failure body carries only a stable user-safe message; the full
+    exception always stays in the server log. The frontend picks its i18n
+    string by ``error_code`` and never reads ``error``, so splicing ``exc`` in
+    would only leak absolute paths and state-file names through the API
+    response.
 
-    ``snapshot_out`` 由调用方传入并在原地填充，因为调用方随后还要拿它去
-    ``_release_storage_startup_barrier_or_rollback``：解除启动屏障失败时同样要按这份
-    pre-image 回滚。
+    ``snapshot_out`` is passed in and filled in place because the caller still
+    needs it for ``_release_storage_startup_barrier_or_rollback``: a failed
+    startup-barrier release also has to roll back from this same pre-image.
     """
     try:
         policy_payload = await _apply_storage_mutation_writes(
@@ -527,11 +638,17 @@ async def _apply_storage_mutation_writes_or_rollback(
             write=write,
         )
     except asyncio.CancelledError:
-        # 取消也必须回滚：_run_locked_storage_job 会先等 worker 跑到终态再放行取消，
-        # 所以「写策略 → 切 root mode」这一串可能已经落盘、也可能中途炸掉（worker 的
-        # 异常在取消路径上只被记日志，不会冒泡到调用方）。两种情况唯一安全的选择都是
-        # 回到 pre-image。CancelledError 是 BaseException，下面的 except Exception
-        # 接不住，所以必须单列。
+        # 取消必须无条件回滚，绝不能按 _write_outcome 跳过。
+        # 理由：取消能走到这里，就说明「解除启动屏障」这一步一定没执行——要么还没轮到它
+        # （这里正是写入函数的返回点），要么正在执行中被
+        # _release_storage_startup_barrier_or_rollback 接走。也就是说这次操作从会话角度看
+        # 从未生效，盘上就不能留着「已生效」的样子：策略文件写着选好了、屏障却还锁着，
+        # 前端浮层不再弹出，用户刷新也救不回来，只能重启应用。
+        # 特别注意 "success" 恰恰是最需要回滚的那一种，不是可以跳过的那一种。
+        # worker 内部已经回滚过（"rolled_back"）时再走一遍是空转：盘上已等于 pre-image 时
+        # _restore_state_file_from_preimage 会跳过写入；快照为空则说明 write() 一行都没跑，
+        # 没有东西需要回滚。
+        # CancelledError 是 BaseException，下面的 except Exception 接不住，所以必须单列。
         if snapshot_out:
             with suppress(Exception, asyncio.CancelledError):
                 await _run_locked_storage_job(
@@ -560,9 +677,10 @@ async def _apply_storage_mutation_writes_or_rollback(
             "error": "写入存储位置配置失败：状态文件当前无法读取（可能不存在，或所在目录不可访问），未发生落盘改动，请稍后重试或检查本机状态目录是否可访问。",
         }
     except Exception as exc:
-        # 写入失败（典型场景：本机状态目录不可写，沙箱 / 反勒索防护下的固定症状）必须
-        # 回滚，否则会留下「策略与 root mode 没跟上」的半截状态 —— 比失败本身更难收拾，
-        # 且调用方只拿到一个没有 error_code 的裸 500。
+        # 写入失败（典型场景：本机状态目录不可写，沙箱 / 反勒索防护下的固定症状）。
+        # 回滚已经在 _job 内部、同一把 root_state_transaction() 里同步执行完毕（见
+        # _apply_storage_mutation_writes），这里不再二次提交回滚 job——二次提交会在两个
+        # 事务之间留出窗口，让第三方把 root_state 改成新值后被旧快照整份盖掉。
         #
         # 四种失败结局的盘上状态各不相同，绝不能共用一句「已恢复原有状态」：
         #   1) 快照读到不可读的状态文件 → write() 一行都没跑（见上面那个分支）；
@@ -585,26 +703,16 @@ async def _apply_storage_mutation_writes_or_rollback(
                 "error_code": "storage_policy_snapshot_failed",
                 "error": "写入存储位置配置失败，未取得状态快照、未发生落盘改动，请检查本机状态目录是否可写后重试。",
             }
-        rollback_error: Exception | None = None
-        try:
-            await _run_locked_storage_job(
-                partial(
-                    _restore_storage_mutation_state,
-                    config_manager,
-                    snapshot_out,
-                    anchor_root=anchor_root,
-                )
-            )
-        except Exception as rollback_exc:
-            rollback_error = rollback_exc
-            logger.exception(
-                "存储位置写入失败后回滚状态也失败，盘上可能残留半截状态",
-            )
-        if rollback_error is not None:
+        # 回滚结果由 _job 写入 snapshot_out["_write_outcome"]：
+        #   - "rolled_back"   → 三步全部成功
+        #   - "rollback_failed" → best-effort 下至少一步失败，异常在 _rollback_error
+        outcome = snapshot_out.get("_write_outcome")
+        if outcome == "rollback_failed":
             # 回滚要往同一个「不可写」的目录里重新落盘，所以它自己也会失败：恢复失败的
             # 迁移分支就是现成的例子——检查点已被 delete_storage_migration 删掉，回滚
             # 要重新写回它，同样会被拒。此时盘上并没有回到 pre-image，绝不能对用户声称
             # 「已恢复原有状态」：用户会据此直接重试，而状态其实停在半截。
+            rollback_error = snapshot_out.get("_rollback_error")
             logger.warning(
                 "[storage_location] 存储位置配置写入失败且回滚失败，盘上状态可能未回到 pre-image: "
                 "写入异常=%s 回滚异常=%s",
@@ -616,6 +724,7 @@ async def _apply_storage_mutation_writes_or_rollback(
                 "error_code": "storage_policy_rollback_failed",
                 "error": "写入存储位置配置失败，且未能恢复原有状态，请检查本机状态目录是否可写；若仍异常请手动确认状态文件。",
             }
+        # outcome == "rolled_back"（或未设置，走保守分支）
         logger.warning(
             "[storage_location] 存储位置配置写入失败，已回滚原有状态: %s",
             exc,

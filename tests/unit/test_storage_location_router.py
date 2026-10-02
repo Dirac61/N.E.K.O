@@ -1482,12 +1482,14 @@ def test_storage_location_select_current_root_recovers_failed_migration_checkpoi
 
 @pytest.mark.unit
 def test_storage_location_select_current_root_rolls_back_when_recovery_write_fails(tmp_path, monkeypatch):
-    """恢复失败迁移检查点时写入失败，必须回滚到 pre-image 并返回新错误码。
+    """A failed write while recovering a failed migration checkpoint must roll back and return the new error code.
 
-    回归点：`_recover_from_failed_migration` 是「删检查点 → 写策略 → 切 root mode」
-    三段写，改动前这三段没有 try/except。只要中间一段抛异常（最典型的就是本机状态
-    目录不可写 —— 沙箱 / 反勒索防护下的固定症状），检查点已经被删掉、策略和 root
-    mode 却还停在 deferred_init，调用方还会收到一个没有任何 error_code 的裸 500。
+    Regression: `_recover_from_failed_migration` is a three-part write (delete
+    checkpoint -> write policy -> switch root mode) with no try/except before
+    this change. Any failing part -- most typically an unwritable local state
+    directory, the standard symptom under a sandbox or anti-ransomware shield --
+    left the checkpoint deleted while policy and root mode still said
+    deferred_init, and the caller got a bare 500 with no error_code at all.
     """
     config_manager = _make_real_config_manager(tmp_path)
     target_root = tmp_path / "target-not-empty" / "N.E.K.O"
@@ -1560,12 +1562,14 @@ def test_storage_location_select_unavailable_selected_root_rolls_back_when_recov
     tmp_path,
     monkeypatch,
 ):
-    """恢复不可用原路径时写入失败，必须回滚到 pre-image 并返回新错误码。
+    """A failed write while recovering an unavailable previous root must roll back and return the new error code.
 
-    回归点：`_recover_from_unavailable_selected_root` 是「写策略 → 切 root mode」
-    两段写，改动前这两段是裸调用、没有 try/except。只要写入抛异常（典型场景仍是本机
-    状态目录不可写），调用方拿到的是一个没有 error_code 的裸 500，前端只能落到兜底的
-    「提交存储位置选择失败，请稍后重试。」。
+    Regression: `_recover_from_unavailable_selected_root` is a two-part write
+    (write policy -> switch root mode) that was called bare, with no try/except,
+    before this change. Any write failure -- again typically an unwritable local
+    state directory -- handed the caller a bare 500 with no error_code, leaving
+    the frontend on its fallback "failed to submit the storage location
+    selection, please retry later" string.
     """
     config_manager = _make_real_config_manager(tmp_path)
     unavailable_selected_root = tmp_path / "offline-selected" / "N.E.K.O"
@@ -1613,11 +1617,13 @@ def test_storage_location_select_unavailable_selected_root_rolls_back_when_recov
 
 @pytest.mark.unit
 def test_storage_location_select_current_root_rolls_back_when_persist_write_fails(tmp_path, monkeypatch):
-    """普通持久化分支写入失败，必须回滚到 pre-image 并返回新错误码。
+    """A failed write in the plain-persistence branch must roll back and return the new error code.
 
-    回归点：`_persist_current_root_selection` 改动前是裸调用，写入抛异常时异常会直接
-    冒出路由（调用方连 500 响应体都拿不到），前端只能显示兜底文案。补上共用 helper 后
-    应当返回带 error_code 的 500，并且不留下半个策略文件。
+    Regression: `_persist_current_root_selection` was called bare before this
+    change, so a write failure escaped straight out of the route -- the caller
+    could not even get a 500 body -- and the frontend showed only its fallback
+    string. With the shared helper it must return a 500 carrying an error_code
+    and leave no half-written policy file behind.
     """
     config_manager = _DummyConfigManager(tmp_path)
     previous_policy = load_storage_policy(config_manager)
@@ -1651,19 +1657,20 @@ def test_storage_location_select_current_root_rolls_back_when_persist_write_fail
 
 
 def _route_anchor_root(config_manager):
-    """按路由的算法取 anchor_root，保证测试断言的就是接口真正用到的那条路径。"""
+    """Compute anchor_root the way the route does, so assertions target the path the endpoint really uses."""
     current_root = normalize_runtime_root(config_manager.app_docs_dir)
     return compute_anchor_root(config_manager, current_root=current_root)
 
 
 @pytest.mark.unit
 def test_storage_location_select_keeps_corrupt_policy_bytes_after_rollback(tmp_path, monkeypatch):
-    """policy 存在但内容损坏时，回滚必须逐字节还回去，绝不能把它删掉。
+    """A corrupt-but-present policy file must be replayed byte-for-byte by the rollback, never deleted.
 
-    回归点：``load_storage_policy`` 把「读取失败」和「文件不存在」都折叠成 None，
-    于是 ``_restore_storage_mutation_state`` 会把这份损坏文件 unlink 掉，还返回
-    「已恢复原有状态」—— 用户丢掉的是一份本来还能人工抢救的状态文件。改成字节
-    pre-image 之后，回滚只照抄字节。
+    Regression: ``load_storage_policy`` folds both "read failed" and "file does
+    not exist" into None, so ``_restore_storage_mutation_state`` unlinked the
+    corrupt file and still reported "restored the previous state" -- the user
+    lost a state file a human could have salvaged. With a byte pre-image the
+    rollback only copies the bytes back.
     """
     config_manager = _DummyConfigManager(tmp_path)
     policy_path = get_storage_policy_path(config_manager, anchor_root=_route_anchor_root(config_manager))
@@ -1694,7 +1701,7 @@ def test_storage_location_select_keeps_corrupt_policy_bytes_after_rollback(tmp_p
 
 @pytest.mark.unit
 def test_storage_location_select_keeps_corrupt_migration_bytes_after_rollback(tmp_path, monkeypatch):
-    """migration 检查点损坏时同样必须逐字节还原，不能被回滚删除。"""
+    """A corrupt migration checkpoint must likewise be replayed byte-for-byte, not deleted by the rollback."""
     config_manager = _DummyConfigManager(tmp_path)
     migration_path = get_storage_migration_path(config_manager, anchor_root=_route_anchor_root(config_manager))
     migration_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1722,13 +1729,16 @@ def test_storage_location_select_keeps_corrupt_migration_bytes_after_rollback(tm
 
 @pytest.mark.unit
 def test_storage_location_select_reports_unreadable_policy_state(tmp_path, monkeypatch):
-    """状态文件存在但读不出字节时：换错误码，且一行都不许落盘。
+    """A state file that exists but cannot be read must switch error codes and write nothing at all.
 
-    用「路径其实是个目录」构造真实的读失败（Windows 报 PermissionError、POSIX 报
-    IsADirectoryError，都是 OSError），不靠 monkeypatch 读取函数本身。
+    The read failure is real, not monkeypatched: the path is actually a
+    directory (Windows raises PermissionError, POSIX raises IsADirectoryError,
+    both OSError).
 
-    回归点：旧实现把这种情况读成 None（等于「文件不存在」），回滚会把这份状态
-    unlink 掉。字节 pre-image 之后，快照阶段就停下：write() 一行不跑，也没人去动它。
+    Regression: the old implementation read this as None (i.e. "file does not
+    exist") and the rollback unlinked the file. With a byte pre-image the run
+    stops during the snapshot phase: write() never runs a line, and nothing
+    touches the file.
     """
     config_manager = _DummyConfigManager(tmp_path)
     policy_path = get_storage_policy_path(config_manager, anchor_root=_route_anchor_root(config_manager))
@@ -1763,7 +1773,7 @@ def test_storage_location_select_reports_unreadable_policy_state(tmp_path, monke
 
 @pytest.mark.unit
 def test_storage_location_select_reports_unreadable_migration_state(tmp_path, monkeypatch):
-    """migration 检查点读不出字节时，同样换错误码且不落盘。"""
+    """An unreadable migration checkpoint must likewise switch error codes and write nothing."""
     config_manager = _DummyConfigManager(tmp_path)
     migration_path = get_storage_migration_path(config_manager, anchor_root=_route_anchor_root(config_manager))
     migration_path.mkdir(parents=True, exist_ok=True)
@@ -1793,12 +1803,16 @@ def test_storage_location_select_reports_unreadable_migration_state(tmp_path, mo
 
 @pytest.mark.unit
 def test_storage_location_select_reports_recovered_when_rollback_has_nothing_to_write(tmp_path, monkeypatch):
-    """写入一步都没成功时，回滚不该去写，也不该报「未能恢复原有状态」。
+    """When not a single write succeeded, the rollback must not write and must not claim "could not restore".
 
-    回归点：旧实现只能在「回滚抛异常」和「回滚成功」之间二选一。而「写入第一步就被拒」
-    时盘上仍是 pre-image —— 回滚本无需写任何东西，却会照着快照重写一遍、再被同一个
-    不可写目录拒绝，于是误报「未能恢复原有状态」，让用户去修一个根本没坏的目录。
-    改成「盘上已等于 pre-image 就跳过写入」之后，回滚不写就不可能失败，如实报已恢复。
+    Regression: the old implementation could only choose between "rollback
+    raised" and "rollback succeeded". When the very first write was denied the
+    disk still held the pre-image -- nothing needed writing -- yet the rollback
+    rewrote the snapshot and was rejected by the same unwritable directory, so
+    it wrongly reported "could not restore the previous state" and sent the user
+    to fix a directory that was never broken. With "skip the write when the disk
+    already equals the pre-image", a rollback that does not write cannot fail
+    and truthfully reports a restore.
     """
     config_manager = _DummyConfigManager(tmp_path)
     anchor_root = _route_anchor_root(config_manager)
@@ -1843,13 +1857,16 @@ def test_storage_location_select_reports_recovered_when_rollback_has_nothing_to_
 
 @pytest.mark.unit
 def test_storage_location_select_reports_rollback_failure_when_rollback_write_also_fails(tmp_path, monkeypatch):
-    """前向写入失败、回滚也失败时，必须返回不声称「已恢复」的错误码。
+    """A failed forward write followed by a failed rollback must return an error code that does not claim a restore.
 
-    回归点：回滚要往同一个不可写目录里重新落盘。恢复失败的迁移分支就是现成的例子 ——
-    检查点已被 ``delete_storage_migration`` 删掉，回滚要重新写回它，同样会被拒。
-    改动前这里只记一条日志，仍然返回 ``storage_policy_write_failed`` 和「已恢复原有
-    状态」的文案：用户会据此直接重试，而盘上其实停在半截状态。所以回滚失败必须换一个
-    不承诺恢复的错误码。
+    Regression: the rollback has to write back into the same unwritable
+    directory. The failed-migration branch is the ready-made example -- the
+    checkpoint was deleted by ``delete_storage_migration``, the rollback must
+    write it back, and that is denied too. Before this change only a log line
+    was emitted while the response still said
+    ``storage_policy_write_failed`` / "restored the previous state", so the user
+    would simply retry while the disk actually sat in a half-state. A failed
+    rollback therefore needs its own error code that promises no restore.
     """
     config_manager = _make_real_config_manager(tmp_path)
     target_root = tmp_path / "target-not-empty" / "N.E.K.O"
@@ -1918,18 +1935,22 @@ def test_storage_location_select_reports_rollback_failure_when_rollback_write_al
 
 @pytest.mark.unit
 def test_storage_location_select_reports_snapshot_failure_without_claiming_restore(tmp_path, monkeypatch):
-    """快照没取成时，必须返回不声称「已恢复」的错误码，并且绝不能去跑回滚。
+    """A snapshot that was never taken must return an error code that does not claim a restore, and must never run the rollback.
 
-    回归点：``_snapshot_storage_mutation_state`` 在写入前读取 root_state 失败时，
-    ``snapshot_out`` 保持为空、写入闭包压根不会执行（快照和写入在同一个 job 里，
-    快照在前）。改动前这条路径落到 ``storage_policy_write_failed`` + 「已恢复原有
-    状态」：既没有恢复动作，也没有确认过盘上内容——走到这里正是因为读 root_state
-    失败，而回滚成功那条路径是有肯定证据的（pre-image 重新落盘成功）。所以必须换
-    一个稳定文案。
+    Regression: when ``_snapshot_storage_mutation_state`` fails to read
+    root_state before the writes, ``snapshot_out`` stays empty and the write
+    closure never runs at all (snapshot and writes share one job, snapshot
+    first). Before this change that path fell into
+    ``storage_policy_write_failed`` / "restored the previous state" -- there was
+    no restore action and the disk contents were never confirmed; reaching here
+    means root_state could not be read, whereas the successful-rollback path has
+    positive evidence (the pre-image was written back). It needs its own stable
+    message.
 
-    同时，空快照下绝不能跑回滚：``_restore_storage_mutation_state`` 会把「没有
-    migration / policy 键」读成「这两个文件本来就不存在」，于是删检查点、unlink
-    策略文件，把本来好好的文件毁掉。
+    An empty snapshot must also never trigger the rollback:
+    ``_restore_storage_mutation_state`` would read "no migration / policy key"
+    as "those two files never existed", delete the checkpoint and unlink the
+    policy file, destroying files that were perfectly fine.
     """
     config_manager = _DummyConfigManager(tmp_path)
 
@@ -1969,8 +1990,228 @@ def test_storage_location_select_reports_snapshot_failure_without_claiming_resto
     assert "[Errno 13]" not in payload["error"]
     # 快照都没取成，绝不能跑回滚
     assert rollback_calls == []
-    # 写入闭包压根没执行，策略文件仍应不存在
-    assert not get_storage_policy_path(config_manager).exists()
+
+
+@pytest.mark.unit
+def test_storage_location_select_rollback_is_best_effort(tmp_path, monkeypatch):
+    """When one rollback step fails, the remaining steps must still be attempted -- no fail-fast.
+
+    Regression: the old implementation went migration -> policy -> root_state and
+    raised on the first failure, so the other two files were never even
+    attempted. Best-effort runs all three, collects the failures and raises an
+    aggregate at the end; even when the migration restore fails, policy and
+    root_state must still be pushed back to their pre-images.
+
+    Uses the ``recovered`` branch: ``write()`` first calls
+    ``delete_storage_migration``, then ``save_storage_policy`` (denied), so the
+    rollback has to write the migration checkpoint back -- this test denies that
+    byte write to make step one fail, and checks policy and root_state are still
+    restored.
+    """
+    config_manager = _make_real_config_manager(tmp_path)
+    target_root = tmp_path / "target-not-empty" / "N.E.K.O"
+    create_pending_storage_migration(
+        config_manager,
+        source_root=config_manager.app_docs_dir,
+        target_root=target_root,
+        selection_source="custom",
+    )
+    save_storage_migration(
+        config_manager,
+        {
+            "status": "failed",
+            "source_root": str(config_manager.app_docs_dir),
+            "target_root": str(target_root),
+            "selection_source": "custom",
+            "error_code": "target_not_empty",
+            "error_message": "目标路径已经包含现有数据，为避免覆盖，本次迁移已停止。",
+        },
+    )
+    config_manager.save_root_state({
+        "mode": "deferred_init",
+        "current_root": str(config_manager.app_docs_dir),
+        "last_known_good_root": str(config_manager.app_docs_dir),
+        "last_migration_result": "failed:target_not_empty",
+        "last_migration_source": str(config_manager.app_docs_dir),
+    })
+    monkeypatch.setattr(
+        storage_location_bootstrap_module,
+        "DEVELOPMENT_ALWAYS_REQUIRE_SELECTION",
+        False,
+    )
+
+    anchor_root = _route_anchor_root(config_manager)
+    migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
+    policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
+    original_policy = policy_path.read_bytes() if policy_path.exists() else None
+
+    # 前向写入失败：写策略被拒
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    # 回滚时：migration 的字节写被拒（第一步失败），policy 路径放行
+    def _selective_byte_write(path, data, *args, **kwargs):
+        if Path(path).name == "storage_migration.json":
+            raise PermissionError(13, "Permission denied")
+        Path(path).write_bytes(data)
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+    monkeypatch.setattr(file_utils_module, "atomic_write_bytes", _selective_byte_write)
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "recovered",
+            },
+        )
+
+    assert response.status_code == 500
+    payload = response.json()
+    # migration 还原失败 → 回滚部分失败 → 不能声称「已恢复」
+    assert payload["error_code"] == "storage_policy_rollback_failed"
+    # migration 没被还原（前向写入删了它，回滚写不回去），文件应不存在
+    assert not migration_path.exists()
+    # policy 已被还原回 pre-image（best-effort 第二步成功）
+    if original_policy is not None:
+        assert policy_path.read_bytes() == original_policy
+    # root_state 也被还原回 pre-image（best-effort 第三步成功）
+    assert config_manager.load_root_state().get("mode") == "deferred_init"
+
+
+@pytest.mark.unit
+def test_storage_location_select_rollback_runs_inside_same_transaction(tmp_path, monkeypatch):
+    """A failing write() must be rolled back inside the same root_state_transaction().
+
+    Regression: the old implementation submitted the rollback as a second job
+    that re-acquired the lock; the window between the two transactions let a
+    third party write a new root_state that the old snapshot then overwrote in
+    full. Verified by ``_run_locked_storage_job`` being called exactly once (the
+    forward job) with no second rollback job.
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+
+    # 前向写入失败
+    def _deny_policy_write(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(storage_location_router_module, "save_storage_policy", _deny_policy_write)
+
+    # 记录 _run_locked_storage_job 被调用的次数
+    job_calls = []
+    original_run_locked = storage_location_router_module._run_locked_storage_job
+
+    async def _counting_run_locked(job):
+        job_calls.append(job)
+        return await original_run_locked(job)
+
+    monkeypatch.setattr(
+        storage_location_router_module,
+        "_run_locked_storage_job",
+        _counting_run_locked,
+    )
+
+    with _build_client(config_manager) as client:
+        response = client.post(
+            "/api/storage/location/select",
+            json={
+                "selected_root": str(config_manager.app_docs_dir),
+                "selection_source": "current",
+            },
+        )
+
+    assert response.status_code == 500
+    # 正向写入阶段只调用一次 _run_locked_storage_job（快照 + 写入 + 同事务回滚），
+    # 没有第二次回滚 job。bootstrap 也会调一次，所以这里只统计写入阶段的 _job。
+    write_jobs = [j for j in job_calls if "_apply_storage_mutation_writes" in getattr(j, "__qualname__", "")]
+    assert len(write_jobs) == 1
+    # 没有任何 _restore_storage_mutation_state 的单独 job 调用
+    rollback_jobs = [
+        j for j in job_calls
+        if getattr(j, "func", None) is storage_location_router_module._restore_storage_mutation_state
+    ]
+    assert rollback_jobs == []
+
+
+@pytest.mark.unit
+def test_storage_location_select_rolls_back_when_cancelled_after_writes_landed(tmp_path, monkeypatch):
+    """A cancellation that lands after the writes succeeded must still roll all three files back.
+
+    Regression: the cancellation branch used to skip the rollback whenever
+    ``_write_outcome`` was "success", on the theory that a landed write should
+    not be undone. But cancelling means the startup barrier is never released
+    (the route never reaches ``_release_storage_startup_barrier_or_rollback``),
+    so keeping the write leaves the disk saying "location chosen" while the
+    session is still locked behind the barrier. The frontend overlay stops
+    appearing and a page reload cannot recover -- only an app restart can. The
+    write and the barrier release are one operation, so a half-done operation
+    must go back to its pre-image.
+    """
+    config_manager = _DummyConfigManager(tmp_path)
+    anchor_root = _route_anchor_root(config_manager)
+
+    # 三个状态文件在盘上都先有一份「改动前」的内容，这样回滚是「改回去」而不是「删掉」
+    policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
+    policy_path.parent.mkdir(parents=True, exist_ok=True)
+    original_policy = b'{"version": 1, "selected_root": "D:/N.E.K.O"}'
+    policy_path.write_bytes(original_policy)
+    migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
+    original_migration = b'{"version": 1, "status": "completed"}'
+    migration_path.write_bytes(original_migration)
+    original_root_state = config_manager.load_root_state()
+
+    # 模拟 _run_locked_storage_job 的既定行为：先等 worker 跑到终态（三步已落盘），
+    # 再把取消送达。只在正向 job 之后抛一次，回滚 job 仍要能正常跑完。
+    cancel_delivered = {"done": False}
+    original_run_locked = storage_location_router_module._run_locked_storage_job
+
+    async def _cancel_after_forward_job(job):
+        result = await original_run_locked(job)
+        if not cancel_delivered["done"]:
+            cancel_delivered["done"] = True
+            raise asyncio.CancelledError()
+        return result
+
+    monkeypatch.setattr(
+        storage_location_router_module,
+        "_run_locked_storage_job",
+        _cancel_after_forward_job,
+    )
+
+    def _write():
+        # 三步写入全部成功，这正是「写已落盘、屏障却没解除」的前提
+        save_storage_policy(
+            config_manager,
+            selected_root=config_manager.app_docs_dir,
+            selection_source="current",
+            anchor_root=anchor_root,
+        )
+        storage_location_router_module.set_root_mode(
+            config_manager,
+            storage_location_router_module.ROOT_MODE_NORMAL,
+            current_root=str(config_manager.app_docs_dir),
+            last_known_good_root=str(config_manager.app_docs_dir),
+        )
+        return load_storage_policy(config_manager, anchor_root=anchor_root)
+
+    state_snapshot: dict = {}
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            storage_location_router_module._apply_storage_mutation_writes_or_rollback(
+                config_manager,
+                anchor_root=anchor_root,
+                snapshot_out=state_snapshot,
+                write=_write,
+            )
+        )
+
+    # 前置条件：写入确实完整落盘过，否则这个用例证明不了「取消了也要回滚」
+    assert state_snapshot["_write_outcome"] == "success"
+    # 取消路径必须把三个文件都退回 pre-image，不能留着「盘上已选好、屏障却还锁着」
+    assert policy_path.read_bytes() == original_policy
+    assert migration_path.read_bytes() == original_migration
+    assert config_manager.load_root_state() == original_root_state
 
 
 @pytest.mark.unit

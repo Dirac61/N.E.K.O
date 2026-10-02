@@ -739,19 +739,23 @@ _TMP_OPEN_FLAGS = os.O_CREAT | os.O_EXCL | os.O_RDWR | getattr(os, "O_BINARY", 0
 
 
 def _create_exclusive_temp_file(target_dir: Path) -> tuple[int, str]:
-    """在目标目录里独占创建一个临时文件，返回 (fd, 绝对路径)。
+    """Create a temp file exclusively in the target directory; return (fd, absolute path).
 
-    刻意不用 ``tempfile.mkstemp``。它在 Windows 上有一个分支：创建文件报
-    PermissionError 时，只要目录「看起来可写」（os.access 查的是静态权限位）
-    就换个随机名字重试。而 Windows 上这个循环的上界 TMP_MAX 是 2147483647，
-    等于没有上界。
+    Deliberately avoids ``tempfile.mkstemp``. On Windows it has a branch that,
+    when file creation raises PermissionError, retries under a fresh random
+    name as long as the directory "looks writable" (os.access reads static
+    permission bits). That loop's bound on Windows is TMP_MAX == 2147483647,
+    i.e. no bound at all.
 
-    沙箱、安全软件这类环境恰好稳定地制造出「静态权限说可写、实际创建被拒」的
-    组合，于是那个分支会一直重试下去：不抛异常、不返回，整个调用方被永久挂住。
-    这正是本项目在受限环境下写盘卡死的原因。
+    Sandboxes and security software reliably produce exactly the combination
+    "static permissions say writable, creation is actually denied", so that
+    branch retries forever: no exception, no return, the caller hangs
+    permanently. This is why this project froze on disk writes in restricted
+    environments.
 
-    这里只对 FileExistsError（随机名撞车）重试，其余 OSError 一律立刻抛出，
-    让调用方拿到一个诚实的异常，而不是无限等待。
+    Here only FileExistsError (random-name collision) is retried; every other
+    OSError is raised immediately, so the caller gets an honest exception
+    instead of an endless wait.
     """
     for _ in range(_TMP_CREATE_MAX_TRIES):
         # 随机段不含点号，符合 _STALE_TMP_RE 的形状要求，能被残留清扫器认领。

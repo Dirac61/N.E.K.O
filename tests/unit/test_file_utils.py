@@ -208,16 +208,18 @@ def test_missing_temp_file_during_cleanup_is_tolerated(tmp_path, monkeypatch):
 
 
 def test_temp_create_permission_denied_fails_fast(tmp_path, monkeypatch):
-    """目录拒绝创建临时文件时，必须第一次就抛出，不得重试。
+    """A directory that denies temp-file creation must raise on the first try, never retry.
 
-    回归点：``tempfile.mkstemp`` 在 Windows 上遇到 PermissionError 时，只要目录
-    「看起来可写」（os.access 查的是静态权限位）就会换个随机名继续试，而上界
-    TMP_MAX 是 2147483647，等于没有上界。沙箱 / 反勒索防护这类环境恰好稳定地
-    制造出「静态权限说可写、实际创建被拒」的组合，于是调用方被永久挂住 —— 这
-    正是存储位置确认接口卡死的根因。
+    Regression: on Windows, ``tempfile.mkstemp`` retries under a fresh random
+    name whenever creation raises PermissionError as long as the directory
+    "looks writable" (os.access reads static permission bits), and its bound is
+    TMP_MAX == 2147483647, i.e. no bound at all. Sandboxes and anti-ransomware
+    shields reliably produce "static permissions say writable, creation is
+    denied", so the caller hangs permanently -- the root cause of the storage
+    location endpoint freezing.
 
-    自建的独占创建只对文件名冲突重试，权限类错误必须立刻抛出，所以这里断言
-    os.open 只被调用了一次。
+    The replacement retries only on file-name collisions and raises permission
+    errors immediately, so os.open must have been called exactly once here.
     """
     target = tmp_path / "state.json"
     attempts: list[str] = []
@@ -236,10 +238,11 @@ def test_temp_create_permission_denied_fails_fast(tmp_path, monkeypatch):
 
 
 def test_temp_name_collision_exhaustion_is_bounded(tmp_path, monkeypatch):
-    """随机名连续撞车时，重试次数必须有上界。
+    """Repeated random-name collisions must be bounded by a fixed retry limit.
 
-    这是本次修复的核心保障：即使每次生成的随机名都撞上已存在的文件，也只允许
-    重试 ``_TMP_CREATE_MAX_TRIES`` 次，然后抛出 FileExistsError，绝不无限循环。
+    This is the core guarantee of the change: even if every generated random
+    name hits an existing file, only ``_TMP_CREATE_MAX_TRIES`` attempts are
+    allowed before FileExistsError is raised -- never an endless loop.
     """
     target = tmp_path / "state.json"
     attempts: list[str] = []
