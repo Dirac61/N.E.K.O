@@ -195,6 +195,7 @@ def test_restart_reports_partial_rollback_failure(tmp_path, monkeypatch, unexpec
     assert response.status_code == 500
     assert response.json()["error_code"] == "storage_policy_rollback_failed"
     assert "private-path" not in response.json()["error"]
+    assert response.json()["restart_mode"] == "migrate_after_shutdown"
     assert "private-worker-error" not in response.json()["error"]
 
 
@@ -236,6 +237,24 @@ async def test_unchanged_preimage_busy_read_skips_unwritable_restore(tmp_path, m
 
 
 @pytest.mark.unit
+def test_root_snapshot_derives_recovery_from_one_raw_read(tmp_path, monkeypatch):
+    manager = _make_real_config_manager(tmp_path)
+    raw = manager.load_raw_root_state()
+    reads = []
+    def read_once(default_value=None):
+        reads.append(1)
+        return dict(raw)
+    monkeypatch.setattr(manager, "load_raw_root_state", read_once)
+    monkeypatch.setattr(manager, "_has_selected_root_unavailable_recovery_override", lambda: True)
+    snapshot = storage_location_router_module._snapshot_storage_mutation_state(
+        manager, anchor_root=manager.anchor_root,
+    )
+    assert reads == [1]
+    assert snapshot["root_state_raw"] == raw
+    assert snapshot["root_state"] == manager._build_selected_root_unavailable_recovery_state(raw)
+
+
+@pytest.mark.unit
 def test_barrier_release_reports_failed_rollback(tmp_path, monkeypatch):
     manager = _DummyConfigManager(tmp_path)
     def release(reason=None):
@@ -253,6 +272,63 @@ def test_barrier_release_reports_failed_rollback(tmp_path, monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_plain_selection_restores_root_modified_by_barrier_release(tmp_path, cancel):
+    manager = _DummyConfigManager(tmp_path)
+    before = manager.load_root_state()
+    migration_path = get_storage_migration_path(manager, anchor_root=_route_anchor_root(manager))
+    migration_path.mkdir(parents=True, exist_ok=True)
+    async def release(reason=None):
+        manager.save_root_state({**before, "last_successful_boot_at": "new-boot-marker"})
+        if cancel:
+            raise asyncio.CancelledError
+        raise RuntimeError("initialization failed after marking startup successful")
+    with _build_client(manager, release_storage_startup_barrier=release):
+        call = storage_location_router_module._post_storage_location_select_locked(
+            storage_location_router_module.StorageLocationSelectionRequest(
+                selected_root=str(manager.app_docs_dir), selection_source="current",
+            ), Response(),
+        )
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        else:
+            result = await call
+            assert result["error_code"] == "startup_release_failed"
+    assert manager.load_root_state() == before
+    assert migration_path.is_dir()
+
+
+@pytest.mark.unit
+def test_restart_migration_write_failure_rolls_back_in_original_job(tmp_path, monkeypatch):
+    manager = _DummyConfigManager(tmp_path)
+    before = manager.load_root_state()
+    jobs = []
+    real_run_job = storage_location_router_module._run_locked_storage_job
+    async def spy_job(job):
+        jobs.append(job)
+        return await real_run_job(job)
+    def deny_mode(*args, **kwargs):
+        raise PermissionError("mode write denied after checkpoint creation")
+    monkeypatch.setattr(storage_location_router_module, "_run_locked_storage_job", spy_job)
+    monkeypatch.setattr(storage_location_router_module, "set_root_mode", deny_mode)
+    with _build_client(manager, request_app_shutdown=lambda: None) as client:
+        response = client.post("/api/storage/location/restart", json={
+            "selected_root": str(tmp_path / "new-storage" / "N.E.K.O"), "selection_source": "custom",
+        })
+    assert response.status_code == 500
+    assert response.json()["error_code"] == "storage_policy_write_failed"
+    # 另一个 job 是路由的 bootstrap reconcile；没有单独的回滚 job。
+    assert sum(getattr(job, "__name__", "") == "_job" for job in jobs) == 1
+    assert not any(getattr(job, "func", None) in (
+        storage_location_router_module._restore_storage_mutation_state,
+        storage_location_router_module._restore_restart_schedule_state,
+    ) for job in jobs)
+    assert not get_storage_migration_path(manager, anchor_root=_route_anchor_root(manager)).exists()
+    assert manager.load_root_state() == before
+
+
+@pytest.mark.unit
 async def test_restart_rebind_cancelled_write_restores_only_once(tmp_path, monkeypatch):
     manager = _make_real_config_manager(tmp_path)
     selected = tmp_path / "offline" / "N.E.K.O"
@@ -264,7 +340,7 @@ async def test_restart_rebind_cancelled_write_restores_only_once(tmp_path, monke
     def restore(*args, **kwargs):
         restores.append(1)
         return real_restore(*args, **kwargs)
-    async def cancelled_write(config_manager, *, anchor_root, snapshot_out, write, policy_only=False):
+    async def cancelled_write(config_manager, *, anchor_root, snapshot_out, write, include_policy=True, include_migration=True):
         snapshot_out.update(storage_location_router_module._snapshot_storage_mutation_state(
             config_manager, anchor_root=anchor_root,
         ))

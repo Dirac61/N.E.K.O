@@ -1003,10 +1003,15 @@ class StorageRootsMixin:
 
     def load_root_state(self, default_value=None):
         """Load root_state; returns the default state when missing."""
+        state, _ = self.load_root_state_with_raw(default_value)
+        return state
+
+    def load_root_state_with_raw(self, default_value=None):
+        """Return semantic and raw root state derived from the same disk read."""
         state = self.load_raw_root_state(default_value)
         if self._has_selected_root_unavailable_recovery_override():
-            return self._build_selected_root_unavailable_recovery_state(state)
-        return state
+            return self._build_selected_root_unavailable_recovery_state(state), state
+        return state, state
 
     def load_raw_root_state(self, default_value=None):
         """Load persisted root_state without applying the runtime recovery override."""

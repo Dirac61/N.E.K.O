@@ -290,35 +290,39 @@ def _read_state_file_preimage(path: Path) -> dict[str, Any]:
         raise _StorageStateUnreadable(path, exc) from exc
 
 
-def _snapshot_storage_mutation_state(config_manager, *, anchor_root: Path, policy_only: bool = False) -> dict[str, Any]:
+def _snapshot_storage_mutation_state(
+    config_manager, *, anchor_root: Path, include_policy: bool = True, include_migration: bool = True,
+) -> dict[str, Any]:
     policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
-    if policy_only:
-        return {"policy_only": True, "policy_preimage": _read_state_file_preimage(policy_path)}
     migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
 
     # root_state 保留严格加载器的合成恢复状态；读失败统一归为状态不可读。
-    root_state = _read_root_state_snapshot(config_manager)
-    root_state_raw = _read_root_state_snapshot(config_manager, raw=True)
+    root_state, root_state_raw = _read_root_state_snapshot(config_manager)
 
     # 回滚只需要原始字节，不解析、也不生成第二套恢复依据。
-    policy_preimage = _read_state_file_preimage(policy_path)
-    migration_preimage = _read_state_file_preimage(migration_path)
+    policy_preimage = _read_state_file_preimage(policy_path) if include_policy else None
+    migration_preimage = _read_state_file_preimage(migration_path) if include_migration else None
 
     return {
         "root_state": root_state,
         "root_state_raw": root_state_raw,
+        "include_policy": include_policy,
+        "include_migration": include_migration,
         "policy_preimage": policy_preimage,
         "migration_preimage": migration_preimage,
     }
 
 
-def _read_root_state_snapshot(config_manager, *, raw: bool = False) -> dict[str, Any]:
+def _read_root_state_snapshot(config_manager) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        loader = getattr(config_manager, "load_raw_root_state", config_manager.load_root_state) if raw else config_manager.load_root_state
-        state = loader()
-        if not isinstance(state, dict):
+        loader = getattr(config_manager, "load_root_state_with_raw", None)
+        if loader is None:
+            state = raw_state = config_manager.load_root_state()
+        else:
+            state, raw_state = loader()
+        if not isinstance(state, dict) or not isinstance(raw_state, dict):
             raise ValueError("root_state must be a JSON object")
-        return state
+        return state, raw_state
     except ValueError as exc:
         raise _StorageStateInvalid(
             Path(getattr(config_manager, "root_state_path", "root_state.json")), exc
@@ -405,7 +409,7 @@ def _restore_storage_mutation_state(
     # ---- 第一步：迁移检查点 ----
     # 有新快照的字节 pre-image 就照抄字节（损坏的检查点也要能逐字节还回去），
     # 「读不出来」的文件到不了这里——快照阶段已终止。
-    if not snapshot.get("policy_only"):
+    if snapshot.get("include_migration", True):
         migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
         migration_preimage = snapshot.get("migration_preimage")
         try:
@@ -420,7 +424,7 @@ def _restore_storage_mutation_state(
             failures.append(("migration", Path(migration_path), exc))
 
     # ---- 第二步：策略文件 ----
-    if include_policy:
+    if include_policy and snapshot.get("include_policy", True):
         policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
         policy_preimage = snapshot.get("policy_preimage")
         try:
@@ -530,7 +534,8 @@ async def _apply_storage_mutation_writes(
     anchor_root: Path,
     snapshot_out: dict[str, Any],
     write: Callable[[], Any],
-    policy_only: bool = False,
+    include_policy: bool = True,
+    include_migration: bool = True,
 ) -> Any:
     """Take the rollback snapshot and run one storage-state write sequence off the loop.
 
@@ -558,7 +563,10 @@ async def _apply_storage_mutation_writes(
         # 退出后回放——快照必须和写入在同一事务里。
         with root_state_transaction():
             snapshot_out.clear()
-            snapshot_out.update(_snapshot_storage_mutation_state(config_manager, anchor_root=anchor_root, policy_only=policy_only))
+            snapshot_out.update(_snapshot_storage_mutation_state(
+                config_manager, anchor_root=anchor_root,
+                include_policy=include_policy, include_migration=include_migration,
+            ))
             # 快照阶段可能抛 _StorageStateUnreadable：此时 write() 一行都没跑，
             # 外层 except _StorageStateUnreadable 分支负责处理，不进下面的 try。
             try:
@@ -591,7 +599,8 @@ async def _apply_storage_mutation_writes_or_rollback(
     anchor_root: Path,
     snapshot_out: dict[str, Any],
     write: Callable[[], Any],
-    policy_only: bool = False,
+    include_policy: bool = True,
+    include_migration: bool = True,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Run one storage-state write; on failure roll back and return the shared failure body.
 
@@ -620,7 +629,8 @@ async def _apply_storage_mutation_writes_or_rollback(
             anchor_root=anchor_root,
             snapshot_out=snapshot_out,
             write=write,
-            policy_only=policy_only,
+            include_policy=include_policy,
+            include_migration=include_migration,
         )
     except asyncio.CancelledError:
         # worker 已结束。成功写入但屏障尚未解除时必须回滚；写入失败已在原事务内
@@ -766,6 +776,27 @@ async def _release_storage_startup_barrier_or_rollback(
                     ("worker", Path(anchor_root), rollback_exc),
                 ]) from rollback_exc
         raise
+
+
+async def _release_storage_startup_barrier_result(
+    config_manager, *, snapshot: dict[str, Any], anchor_root: Path, reason: str,
+) -> tuple[int, dict[str, Any]] | None:
+    try:
+        await _release_storage_startup_barrier_or_rollback(
+            config_manager, snapshot=snapshot, anchor_root=anchor_root, reason=reason,
+        )
+    except _StorageRollbackPartialError:
+        return 500, {
+            "ok": False, "error_code": "storage_policy_rollback_failed",
+            "error": "未能确认原有状态已恢复，请检查状态文件。",
+        }
+    except Exception:
+        logger.exception("failed to release storage startup barrier")
+        return 503, {
+            "ok": False, "error_code": "startup_release_failed",
+            "error": "当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。",
+        }
+    return None
 
 
 def _safe_path_size(path: Path) -> int:
@@ -2005,23 +2036,13 @@ async def _post_storage_location_select_locked(
                 if write_error is not None:
                     response.status_code = 500
                     return write_error
-                try:
-                    await _release_storage_startup_barrier_or_rollback(
-                        config_manager,
-                        snapshot=state_snapshot,
-                        anchor_root=anchor_root,
-                        reason="storage_selection_continue_current_session",
-                    )
-                except _StorageRollbackPartialError:
-                    response.status_code = 500
-                    return {"ok": False, "error_code": "storage_policy_rollback_failed", "error": "未能确认原有状态已恢复，请检查状态文件。"}
-                except Exception as exc:
-                    response.status_code = 503
-                    return {
-                        "ok": False,
-                        "error_code": "startup_release_failed",
-                        "error": f"当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。{exc}",
-                    }
+                release_error = await _release_storage_startup_barrier_result(
+                    config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
+                    reason="storage_selection_continue_current_session",
+                )
+                if release_error is not None:
+                    response.status_code, error_body = release_error
+                    return error_body
                 return {
                     "ok": True,
                     "result": "continue_current_session",
@@ -2055,23 +2076,13 @@ async def _post_storage_location_select_locked(
             if write_error is not None:
                 response.status_code = 500
                 return write_error
-            try:
-                await _release_storage_startup_barrier_or_rollback(
-                    config_manager,
-                    snapshot=state_snapshot,
-                    anchor_root=anchor_root,
-                    reason="storage_selection_continue_current_session",
-                )
-            except _StorageRollbackPartialError:
-                response.status_code = 500
-                return {"ok": False, "error_code": "storage_policy_rollback_failed", "error": "未能确认原有状态已恢复，请检查状态文件。"}
-            except Exception as exc:
-                response.status_code = 503
-                return {
-                    "ok": False,
-                    "error_code": "startup_release_failed",
-                    "error": f"当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。{exc}",
-                }
+            release_error = await _release_storage_startup_barrier_result(
+                config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
+                reason="storage_selection_continue_current_session",
+            )
+            if release_error is not None:
+                response.status_code, error_body = release_error
+                return error_body
             return {
                 "ok": True,
                 "result": "continue_current_session",
@@ -2092,28 +2103,18 @@ async def _post_storage_location_select_locked(
             anchor_root=anchor_root,
             snapshot_out=state_snapshot,
             write=_persist_current_root_selection,
-            policy_only=True,
+            include_migration=False,
         )
         if write_error is not None:
             response.status_code = 500
             return write_error
-        try:
-            await _release_storage_startup_barrier_or_rollback(
-                config_manager,
-                snapshot=state_snapshot,
-                anchor_root=anchor_root,
-                reason="storage_selection_continue_current_session",
-            )
-        except _StorageRollbackPartialError:
-            response.status_code = 500
-            return {"ok": False, "error_code": "storage_policy_rollback_failed", "error": "未能确认原有状态已恢复，请检查状态文件。"}
-        except Exception as exc:
-            response.status_code = 503
-            return {
-                "ok": False,
-                "error_code": "startup_release_failed",
-                "error": f"当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。{exc}",
-            }
+        release_error = await _release_storage_startup_barrier_result(
+            config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
+            reason="storage_selection_continue_current_session",
+        )
+        if release_error is not None:
+            response.status_code, error_body = release_error
+            return error_body
         return {
             "ok": True,
             "result": "continue_current_session",
@@ -2393,7 +2394,7 @@ async def _post_storage_location_restart_locked(
             # "正在迁移"。
             # CancelledError 是 BaseException，下面的 except Exception 接不住，所以
             # 必须单列。回滚 worker 即使再收到取消也会先跑到终态。
-            if state_snapshot.get("_write_outcome") == "success":
+            if state_snapshot:
                 with suppress(Exception, asyncio.CancelledError):
                     await _run_locked_storage_job(
                         partial(
@@ -2476,37 +2477,30 @@ async def _post_storage_location_restart_locked(
         # The pre-images cannot be captured while cloud_apply_fence exposes a
         # temporary root mode. Keep them in the same transaction as both writes
         # so rollback always restores the state immediately preceding this job.
-        with root_state_transaction():
-            # 两份 pre-image 都读到之后再一起记进 rollback_state，这样
-            # "rollback_state 非空" 就等价于 "两份都在手上"。分两次记的话，第二次读
-            # 抛异常会留下 migration 键缺失，回滚分支就会把一份本来就存在的检查点删掉。
-            previous_root_state = _read_root_state_snapshot(config_manager)
-            previous_root_state_raw = _read_root_state_snapshot(config_manager, raw=True)
-            previous_migration = _read_state_file_preimage(
-                get_storage_migration_path(config_manager, anchor_root=anchor_root)
-            )
-            rollback_state["root_state"] = previous_root_state
-            rollback_state["root_state_raw"] = previous_root_state_raw
-            rollback_state["migration_preimage"] = previous_migration
-            pending_payload = create_pending_storage_migration(
-                config_manager,
-                source_root=current_root,
-                target_root=normalized_selected_root,
-                selection_source=payload.selection_source,
-                anchor_root=anchor_root,
-                confirmed_existing_target_content=bool(payload.confirm_existing_target_content),
-            )
-            set_root_mode(
-                config_manager,
-                ROOT_MODE_MAINTENANCE_READONLY,
-                last_migration_source=str(current_root),
-                last_migration_result=f"restart_pending:{normalized_selected_root}",
-            )
-            return pending_payload
+        pending_payload = create_pending_storage_migration(
+            config_manager,
+            source_root=current_root,
+            target_root=normalized_selected_root,
+            selection_source=payload.selection_source,
+            anchor_root=anchor_root,
+            confirmed_existing_target_content=bool(payload.confirm_existing_target_content),
+        )
+        set_root_mode(
+            config_manager,
+            ROOT_MODE_MAINTENANCE_READONLY,
+            last_migration_source=str(current_root),
+            last_migration_result=f"restart_pending:{normalized_selected_root}",
+        )
+        return pending_payload
 
-    migration_payload = None
+    migration_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
+        config_manager, anchor_root=anchor_root, snapshot_out=rollback_state,
+        write=_schedule_pending_migration, include_policy=False,
+    )
+    if write_error is not None:
+        response.status_code = 500
+        return {**write_error, "restart_mode": "migrate_after_shutdown", **restart_preflight}
     try:
-        migration_payload = await _run_locked_storage_job(_schedule_pending_migration)
         await _request_app_shutdown(request_app_shutdown)
     except _ShutdownAcceptedCancellation:
         # Shutdown 已经被 launcher 接受；待迁移检查点正是退出后的接力依据。
@@ -2525,11 +2519,9 @@ async def _post_storage_location_restart_locked(
                     )
                 )
         raise
-    except Exception as exc:
+    except Exception:
         logger.exception("failed to schedule storage migration shutdown")
-        # rollback_state 为空 = 两份 pre-image 还没读到，也就意味着
-        # create_pending_storage_migration 一行都还没跑，没有东西需要回滚。这时候
-        # 走下面的分支反而会把一份本来就在盘上的检查点删掉。
+        # 写入阶段已由共享入口处理，这里只处理写入成功后的关闭失败。
         if rollback_state:
             try:
                 await _run_locked_storage_job(
@@ -2547,23 +2539,15 @@ async def _post_storage_location_restart_locked(
                     "ok": False,
                     "error_code": "storage_policy_rollback_failed",
                     "error": "受控关闭启动失败，且未能恢复原有状态，请检查本机状态目录是否可写。",
+                    "restart_mode": "migrate_after_shutdown",
                     **restart_preflight,
                 }
         response.status_code = 500
         return {
             "ok": False,
-            "error_code": (
-                "storage_state_invalid" if isinstance(exc, _StorageStateInvalid)
-                else "storage_state_unreadable" if isinstance(exc, _StorageStateUnreadable)
-                else "restart_schedule_failed"
-            ),
-            "error": (
-                "存储状态文件内容损坏或格式无效，未发生落盘改动，请检查或恢复状态文件。"
-                if isinstance(exc, _StorageStateInvalid)
-                else "受控关闭启动失败，状态文件当前无法读取，请检查本机状态目录是否可访问后重试。"
-                if isinstance(exc, _StorageStateUnreadable)
-                else "受控关闭启动失败，请稍后重试。"
-            ),
+            "error_code": "restart_schedule_failed",
+            "error": "受控关闭启动失败，请稍后重试。",
+            "restart_mode": "migrate_after_shutdown",
             **restart_preflight,
         }
 

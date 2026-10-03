@@ -968,6 +968,15 @@ def test_read_json_raises_on_missing_file(tmp_path):
         read_json(tmp_path / "absent.json")
 
 
+def test_exclusive_temp_file_returns_absolute_path_for_relative_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    fd, path = file_utils._create_exclusive_temp_file(Path("."))
+    os.close(fd)
+    assert Path(path).is_absolute()
+    monkeypatch.chdir(tmp_path.parent)
+    Path(path).unlink()
+
+
 async def test_async_read_raises_on_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         await read_json_async(tmp_path / "absent.json")
