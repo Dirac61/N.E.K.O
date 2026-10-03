@@ -1372,14 +1372,6 @@
         }
     }
 
-    var STORAGE_ERROR_DETAIL_MAX_LEN = 200;
-
-    function truncateErrorDetail(text) {
-        var trimmed = String(text || '').trim();
-        if (trimmed.length <= STORAGE_ERROR_DETAIL_MAX_LEN) return trimmed;
-        return trimmed.slice(0, STORAGE_ERROR_DETAIL_MAX_LEN) + '…';
-    }
-
     function extractResponseError(payload, fallbackText) {
         if (payload && typeof payload === 'object') {
             var rawError = typeof payload.error === 'string' ? String(payload.error).trim() : '';
@@ -1389,17 +1381,6 @@
             }
             var codedText = translateResponseErrorCode(code, '');
             if (codedText) {
-                // startup_release_failed 这类后端会把异常细节塞进 payload.error
-                // （f"... {exc}" 风格）。完整字符串可能含路径/异常类名/栈片段，
-                // 直接展示既不友好也可能泄露内部信息。所以：
-                //   - 完整原文打到 console.warn 给开发者看
-                //   - UI 只展示翻译后的概括语 + 裁短的尾巴（≤200 字符）
-                if (code === 'startup_release_failed' && rawError && rawError !== codedText) {
-                    try {
-                        console.warn('[storage-location] startup_release_failed detail:', rawError);
-                    } catch (_) {}
-                    return codedText + ' ' + truncateErrorDetail(rawError);
-                }
                 return codedText;
             }
             // 未在 translateResponseErrorCode 命中的 error_code 走通用兜底：

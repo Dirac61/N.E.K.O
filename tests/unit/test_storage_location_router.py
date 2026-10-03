@@ -160,6 +160,38 @@ async def test_executor_failure_is_not_diagnosed_as_unwritable_directory(tmp_pat
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("error_type", [AttributeError, KeyError])
+async def test_root_snapshot_programming_error_is_not_reported_as_unreadable(tmp_path, monkeypatch, error_type):
+    manager = _DummyConfigManager(tmp_path)
+    def broken_loader():
+        raise error_type("private-programming-error")
+    monkeypatch.setattr(manager, "load_root_state", broken_loader)
+    _, error = await storage_location_router_module._apply_storage_mutation_writes_or_rollback(
+        manager, anchor_root=manager.anchor_root, snapshot_out={}, write=lambda: None,
+    )
+    assert error["error_code"] == "storage_operation_failed"
+    assert "private-" not in error["error"]
+
+
+@pytest.mark.unit
+def test_unavailable_root_recovery_ignores_untouched_unreadable_migration(tmp_path, monkeypatch):
+    manager = _make_real_config_manager(tmp_path)
+    unavailable = tmp_path / "offline" / "N.E.K.O"
+    save_storage_policy(manager, selected_root=unavailable, selection_source="custom")
+    manager = _make_real_config_manager(tmp_path)
+    path = get_storage_migration_path(manager, anchor_root=_route_anchor_root(manager))
+    path.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(storage_location_bootstrap_module, "DEVELOPMENT_ALWAYS_REQUIRE_SELECTION", False)
+    with _build_client(manager) as client:
+        response = client.post("/api/storage/location/select", json={
+            "selected_root": str(manager.app_docs_dir), "selection_source": "current",
+        })
+    assert response.status_code == 200
+    assert response.json()["result"] == "continue_current_session"
+    assert path.is_dir()
+
+
+@pytest.mark.unit
 def test_restart_restore_unchanged_root_skips_write(tmp_path, monkeypatch):
     manager = _DummyConfigManager(tmp_path)
     writes = []
@@ -168,8 +200,8 @@ def test_restart_restore_unchanged_root_skips_write(tmp_path, monkeypatch):
         raise PermissionError("directory unwritable")
     before = manager.load_root_state()
     monkeypatch.setattr(manager, "save_root_state", deny_write)
-    storage_location_router_module._restore_restart_schedule_state(
-        manager, {"root_state": before, "migration_preimage": {"existed": False, "bytes": None}},
+    storage_location_router_module._restore_storage_mutation_state(
+        manager, {"include_policy": False, "root_state": before, "migration_preimage": {"existed": False, "bytes": None}},
         anchor_root=manager.anchor_root,
     )
     assert writes == []
@@ -187,7 +219,7 @@ def test_restart_reports_partial_rollback_failure(tmp_path, monkeypatch, unexpec
         raise storage_location_router_module._StorageRollbackPartialError([
             ("root_state", manager.anchor_root / "state" / "root_state.json", PermissionError("private-path")),
         ])
-    monkeypatch.setattr(storage_location_router_module, "_restore_restart_schedule_state", deny_restore)
+    monkeypatch.setattr(storage_location_router_module, "_restore_storage_mutation_state", deny_restore)
     with _build_client(manager, request_app_shutdown=shutdown) as client:
         response = client.post("/api/storage/location/restart", json={
             "selected_root": str(tmp_path / "new-storage" / "N.E.K.O"), "selection_source": "custom",
@@ -322,7 +354,6 @@ def test_restart_migration_write_failure_rolls_back_in_original_job(tmp_path, mo
     assert sum(getattr(job, "__name__", "") == "_job" for job in jobs) == 1
     assert not any(getattr(job, "func", None) in (
         storage_location_router_module._restore_storage_mutation_state,
-        storage_location_router_module._restore_restart_schedule_state,
     ) for job in jobs)
     assert not get_storage_migration_path(manager, anchor_root=_route_anchor_root(manager)).exists()
     assert manager.load_root_state() == before
@@ -1680,9 +1711,9 @@ def test_restart_rollback_never_deletes_existing_checkpoint_after_restore_failur
         "exception",
     ) as log_exception:
         with pytest.raises(storage_location_router_module._StorageRollbackPartialError):
-            storage_location_router_module._restore_restart_schedule_state(
+            storage_location_router_module._restore_storage_mutation_state(
                 config_manager,
-                {"migration_preimage": {"existed": True, "bytes": json.dumps(previous_migration).encode()}, "root_state": {"mode": "deferred_init"}},
+                {"include_policy": False, "migration_preimage": {"existed": True, "bytes": json.dumps(previous_migration).encode()}, "root_state": {"mode": "deferred_init"}},
                 anchor_root=config_manager.anchor_root,
             )
 

@@ -936,6 +936,7 @@ def test_sweeper_is_thread_safe_for_the_same_target(tmp_path):
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory collision semantics")
 def test_windows_permission_collision_retries_but_directory_denial_does_not(tmp_path, monkeypatch, caplog):
+    caplog.set_level("DEBUG", logger=file_utils.logger.name)
     real_open = file_utils.os.open
     attempts = []
 

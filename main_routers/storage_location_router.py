@@ -57,6 +57,7 @@ from utils.cloudsave_runtime import (
     is_cloudsave_disabled_due_to_local_state_unavailable,
     set_root_mode,
 )
+from utils.config_manager import LocalStateDirectoryError
 from utils.storage_location_bootstrap import (
     STORAGE_STARTUP_BLOCKING_REASONS,
     STORAGE_STATUS_POLL_INTERVAL_MS,
@@ -327,7 +328,7 @@ def _read_root_state_snapshot(config_manager) -> tuple[dict[str, Any], dict[str,
         raise _StorageStateInvalid(
             Path(getattr(config_manager, "root_state_path", "root_state.json")), exc
         ) from exc
-    except Exception as exc:
+    except (OSError, LocalStateDirectoryError) as exc:
         raise _StorageStateUnreadable(
             Path(getattr(config_manager, "root_state_path", "root_state.json")), exc
         ) from exc
@@ -374,15 +375,21 @@ def _restore_state_file_from_preimage(path: Path, preimage: dict[str, Any]) -> N
 
 
 def _restore_storage_mutation_state(
+    config_manager, snapshot: dict[str, Any], *, anchor_root: Path,
+) -> None:
+    with root_state_transaction():
+        _restore_storage_mutation_state_locked(config_manager, snapshot, anchor_root=anchor_root)
+
+
+def _restore_storage_mutation_state_locked(
     config_manager,
     snapshot: dict[str, Any],
     *,
     anchor_root: Path,
-    include_policy: bool = True,
 ) -> None:
     """Roll applicable storage state files back to a snapshot synchronously.
 
-    Restart scheduling does not change policy, so it passes ``include_policy=False``.
+    Snapshot flags identify the files that participate in this rollback.
 
     Best-effort: migration / policy / root_state are each restored on their own,
     and a failing step does not stop the later ones. Once all three have run,
@@ -424,7 +431,7 @@ def _restore_storage_mutation_state(
             failures.append(("migration", Path(migration_path), exc))
 
     # ---- 第二步：策略文件 ----
-    if include_policy and snapshot.get("include_policy", True):
+    if snapshot.get("include_policy", True):
         policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
         policy_preimage = snapshot.get("policy_preimage")
         try:
@@ -476,19 +483,6 @@ def _restore_storage_mutation_state(
     # 三步全部跑完后，只要有任意一步失败就抛聚合异常；全成功则静默返回
     if failures:
         raise _StorageRollbackPartialError(failures)
-
-
-def _restore_restart_schedule_state(
-    config_manager,
-    snapshot: dict[str, Any],
-    *,
-    anchor_root: Path,
-) -> None:
-    """Restore the restart checkpoint and root state as one worker job."""
-    with root_state_transaction():
-        _restore_storage_mutation_state(
-            config_manager, snapshot, anchor_root=anchor_root, include_policy=False,
-        )
 
 
 async def _run_locked_storage_job(job: Callable[[], Any]) -> Any:
@@ -797,6 +791,31 @@ async def _release_storage_startup_barrier_result(
             "error": "当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。",
         }
     return None
+
+
+async def _complete_current_root_selection(
+    config_manager, *, response: Response, anchor_root: Path, current_root: Path,
+    write: Callable[[], Any], include_migration: bool = True,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+    policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
+        config_manager, anchor_root=anchor_root, snapshot_out=snapshot,
+        write=write, include_migration=include_migration,
+    )
+    if write_error is not None:
+        response.status_code = 500
+        return write_error
+    release_error = await _release_storage_startup_barrier_result(
+        config_manager, snapshot=snapshot, anchor_root=anchor_root,
+        reason="storage_selection_continue_current_session",
+    )
+    if release_error is not None:
+        response.status_code, error_body = release_error
+        return error_body
+    return {
+        "ok": True, "result": "continue_current_session",
+        "selected_root": str(current_root), "selection_source": policy_payload["selection_source"],
+    }
 
 
 def _safe_path_size(path: Path) -> int:
@@ -2026,29 +2045,11 @@ async def _post_storage_location_select_locked(
                     )
                     return recovered_policy
 
-                state_snapshot: dict[str, Any] = {}
-                policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
-                    config_manager,
-                    anchor_root=anchor_root,
-                    snapshot_out=state_snapshot,
+                return await _complete_current_root_selection(
+                    config_manager, response=response,
+                    anchor_root=anchor_root, current_root=current_root,
                     write=_recover_from_failed_migration,
                 )
-                if write_error is not None:
-                    response.status_code = 500
-                    return write_error
-                release_error = await _release_storage_startup_barrier_result(
-                    config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
-                    reason="storage_selection_continue_current_session",
-                )
-                if release_error is not None:
-                    response.status_code, error_body = release_error
-                    return error_body
-                return {
-                    "ok": True,
-                    "result": "continue_current_session",
-                    "selected_root": str(current_root),
-                    "selection_source": policy_payload["selection_source"],
-                }
 
             def _recover_from_unavailable_selected_root() -> dict[str, Any]:
                 recovered_policy = save_storage_policy(
@@ -2066,29 +2067,12 @@ async def _post_storage_location_select_locked(
                 )
                 return recovered_policy
 
-            state_snapshot = {}
-            policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
-                config_manager,
-                anchor_root=anchor_root,
-                snapshot_out=state_snapshot,
+            return await _complete_current_root_selection(
+                config_manager, response=response,
+                anchor_root=anchor_root, current_root=current_root,
                 write=_recover_from_unavailable_selected_root,
+                include_migration=False,
             )
-            if write_error is not None:
-                response.status_code = 500
-                return write_error
-            release_error = await _release_storage_startup_barrier_result(
-                config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
-                reason="storage_selection_continue_current_session",
-            )
-            if release_error is not None:
-                response.status_code, error_body = release_error
-                return error_body
-            return {
-                "ok": True,
-                "result": "continue_current_session",
-                "selected_root": str(current_root),
-                "selection_source": policy_payload["selection_source"],
-            }
         def _persist_current_root_selection() -> dict[str, Any]:
             return save_storage_policy(
                 config_manager,
@@ -2097,30 +2081,12 @@ async def _post_storage_location_select_locked(
                 anchor_root=anchor_root,
             )
 
-        state_snapshot = {}
-        policy_payload, write_error = await _apply_storage_mutation_writes_or_rollback(
-            config_manager,
-            anchor_root=anchor_root,
-            snapshot_out=state_snapshot,
+        return await _complete_current_root_selection(
+            config_manager, response=response,
+            anchor_root=anchor_root, current_root=current_root,
             write=_persist_current_root_selection,
             include_migration=False,
         )
-        if write_error is not None:
-            response.status_code = 500
-            return write_error
-        release_error = await _release_storage_startup_barrier_result(
-            config_manager, snapshot=state_snapshot, anchor_root=anchor_root,
-            reason="storage_selection_continue_current_session",
-        )
-        if release_error is not None:
-            response.status_code, error_body = release_error
-            return error_body
-        return {
-            "ok": True,
-            "result": "continue_current_session",
-            "selected_root": str(current_root),
-            "selection_source": policy_payload["selection_source"],
-        }
 
     if bool(blocking_bootstrap.get("recovery_required")) and selected_root_missing_recovery:
         if not paths_equal(normalized_selected_root, committed_selected_root):
@@ -2512,7 +2478,7 @@ async def _post_storage_location_restart_locked(
             with suppress(Exception, asyncio.CancelledError):
                 await _run_locked_storage_job(
                     partial(
-                        _restore_restart_schedule_state,
+                        _restore_storage_mutation_state,
                         config_manager,
                         rollback_state,
                         anchor_root=anchor_root,
@@ -2526,7 +2492,7 @@ async def _post_storage_location_restart_locked(
             try:
                 await _run_locked_storage_job(
                     partial(
-                        _restore_restart_schedule_state,
+                        _restore_storage_mutation_state,
                         config_manager,
                         rollback_state,
                         anchor_root=anchor_root,

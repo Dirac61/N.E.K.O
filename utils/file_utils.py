@@ -778,7 +778,7 @@ def _create_exclusive_temp_file(target_dir: Path) -> tuple[int, str]:
                 continue
             # 目录被删、磁盘满、路径过长等其他错误，直接抛出。
             # 这里是本次修复的核心：不再重试，也就不会再出现无限循环。
-            logger.warning(
+            logger.debug(
                 "[file_utils] 临时文件创建失败，本次写入放弃: dir=%s errno=%s error=%s",
                 target_dir,
                 getattr(exc, "errno", None),
