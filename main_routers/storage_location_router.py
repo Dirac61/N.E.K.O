@@ -321,11 +321,7 @@ def _snapshot_storage_mutation_state(
 
 def _read_root_state_snapshot(config_manager) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
-        loader = getattr(config_manager, "load_root_state_with_raw", None)
-        if loader is None:
-            state = raw_state = config_manager.load_root_state()
-        else:
-            state, raw_state = loader()
+        state, raw_state = config_manager.load_root_state_with_raw()
         if not isinstance(state, dict) or not isinstance(raw_state, dict):
             raise ValueError("root_state must be a JSON object")
         return state, raw_state
@@ -417,37 +413,21 @@ def _restore_storage_mutation_state_locked(
 
     failures: list[tuple[str, Path, BaseException]] = []
 
-    # ---- 第一步：迁移检查点 ----
-    # 有新快照的字节 pre-image 就照抄字节（损坏的检查点也要能逐字节还回去），
-    # 「读不出来」的文件到不了这里——快照阶段已终止。
-    if snapshot.get("include_migration", True):
-        migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
-        migration_preimage = snapshot.get("migration_preimage")
+    for step, path_fn in (
+        ("migration", get_storage_migration_path),
+        ("policy", get_storage_policy_path),
+    ):
+        if not snapshot.get(f"include_{step}", True):
+            continue
+        state_path = path_fn(config_manager, anchor_root=anchor_root)
+        preimage = snapshot.get(f"{step}_preimage")
         try:
-            if not isinstance(migration_preimage, dict):
-                raise RuntimeError("missing migration pre-image")
-            _restore_state_file_from_preimage(migration_path, migration_preimage)
+            if not isinstance(preimage, dict):
+                raise RuntimeError(f"missing {step} pre-image")
+            _restore_state_file_from_preimage(state_path, preimage)
         except Exception as exc:
-            logger.exception(
-                "[storage_location] 回滚迁移检查点失败，继续尝试还原其余状态文件: %s",
-                migration_path,
-            )
-            failures.append(("migration", Path(migration_path), exc))
-
-    # ---- 第二步：策略文件 ----
-    if snapshot.get("include_policy", True):
-        policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
-        policy_preimage = snapshot.get("policy_preimage")
-        try:
-            if not isinstance(policy_preimage, dict):
-                raise RuntimeError("missing policy pre-image")
-            _restore_state_file_from_preimage(policy_path, policy_preimage)
-        except Exception as exc:
-            logger.exception(
-                "[storage_location] 回滚策略文件失败，继续尝试还原 root_state: %s",
-                policy_path,
-            )
-            failures.append(("policy", Path(policy_path), exc))
+            logger.exception("failed to restore %s, continuing remaining storage restores: %s", step, state_path)
+            failures.append((step, Path(state_path), exc))
 
     # ---- 第三步：root_state ----
     previous_root_state = snapshot.get("root_state")
@@ -459,8 +439,7 @@ def _restore_storage_mutation_state_locked(
         root_state_path = Path(getattr(config_manager, "root_state_path", ""))
         try:
             try:
-                load_raw_state = getattr(config_manager, "load_raw_root_state", config_manager.load_root_state)
-                current_root_state = load_raw_state()
+                current_root_state = config_manager.load_raw_root_state()
             except Exception:
                 current_root_state = None
             if current_root_state == previous_root_state or (
@@ -741,19 +720,16 @@ async def _release_storage_startup_barrier_or_rollback(
         # 回滚的那个状态。下面无条件 raise，所以 KeyboardInterrupt / SystemExit 的
         # 语义不变。
         try:
-            # root_state 生命周期锁可能由另一个 async 请求持有；回滚若在事件循环线程
-            # 同步等锁，会卡住持锁请求恢复执行。整段送进 worker，并让 helper 在取消后
-            # 仍等到 worker 终态。这里 suppress 的只是 helper 重新传播的取消，下面的
-            # bare raise 仍会保留原始 BaseException。
-            with suppress(asyncio.CancelledError):
-                await _run_locked_storage_job(
-                    partial(
-                        _restore_storage_mutation_state,
-                        config_manager,
-                        snapshot,
-                        anchor_root=anchor_root,
-                    )
-                )
+            restore = partial(_restore_storage_mutation_state, config_manager, snapshot, anchor_root=anchor_root)
+            if isinstance(release_exc, asyncio.CancelledError):
+                with suppress(asyncio.CancelledError):
+                    await _run_locked_storage_job(restore)
+            else:
+                await _run_locked_storage_job(restore)
+        except asyncio.CancelledError:
+            snapshot["_write_outcome"] = "rollback_unknown"
+            logger.warning("startup barrier rollback outcome unknown after cancellation")
+            raise
         except Exception as rollback_exc:
             logger.exception(
                 "failed to rollback storage mutation state after startup barrier release failed",

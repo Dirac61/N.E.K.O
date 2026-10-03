@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,7 +80,7 @@ async def test_root_state_snapshot_read_error_is_classified_without_writes(tmp_p
     manager = _DummyConfigManager(tmp_path)
     def deny_read():
         raise PermissionError("private-path")
-    monkeypatch.setattr(manager, "load_root_state", deny_read)
+    monkeypatch.setattr(manager, "load_root_state_with_raw", deny_read)
     writes = []
     _, error = await storage_location_router_module._apply_storage_mutation_writes_or_rollback(
         manager, anchor_root=manager.anchor_root, snapshot_out={}, write=lambda: writes.append(1),
@@ -160,12 +161,55 @@ async def test_executor_failure_is_not_diagnosed_as_unwritable_directory(tmp_pat
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("restore_fails", [False, True])
+async def test_barrier_rollback_cancellation_is_propagated(tmp_path, monkeypatch, restore_fails):
+    manager = _DummyConfigManager(tmp_path)
+    started = threading.Event()
+    finish = threading.Event()
+    finished = threading.Event()
+    async def fail_release(**kwargs):
+        raise RuntimeError("barrier release failed")
+    def restore(*args, **kwargs):
+        started.set()
+        try:
+            assert finish.wait(3)
+            if restore_fails:
+                raise RuntimeError("rollback failed")
+        finally:
+            finished.set()
+    monkeypatch.setattr(storage_location_router_module, "_release_storage_startup_barrier_if_needed", fail_release)
+    monkeypatch.setattr(storage_location_router_module, "_restore_storage_mutation_state", restore)
+    task = asyncio.create_task(storage_location_router_module._release_storage_startup_barrier_result(
+        manager, snapshot={"root_state": manager.load_root_state()}, anchor_root=manager.anchor_root, reason="test",
+    ))
+    try:
+        assert await asyncio.to_thread(started.wait, 3)
+        task.cancel()
+    finally:
+        finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
+
+
+@pytest.mark.unit
+def test_corrupt_root_state_remains_logged(tmp_path, caplog):
+    manager = _make_real_config_manager(tmp_path)
+    manager.root_state_path.parent.mkdir(parents=True, exist_ok=True)
+    manager.root_state_path.write_text("{truncated", encoding="utf-8")
+    with pytest.raises(json.JSONDecodeError):
+        manager.load_root_state()
+    assert "加载 JSON 文件失败" in caplog.text
+    assert "root_state.json" in caplog.text
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("error_type", [AttributeError, KeyError])
 async def test_root_snapshot_programming_error_is_not_reported_as_unreadable(tmp_path, monkeypatch, error_type):
     manager = _DummyConfigManager(tmp_path)
     def broken_loader():
         raise error_type("private-programming-error")
-    monkeypatch.setattr(manager, "load_root_state", broken_loader)
+    monkeypatch.setattr(manager, "load_root_state_with_raw", broken_loader)
     _, error = await storage_location_router_module._apply_storage_mutation_writes_or_rollback(
         manager, anchor_root=manager.anchor_root, snapshot_out={}, write=lambda: None,
     )
@@ -533,6 +577,13 @@ class _DummyConfigManager:
 
     def load_root_state(self):
         return dict(self._root_state)
+
+    def load_raw_root_state(self):
+        return dict(self._root_state)
+
+    def load_root_state_with_raw(self):
+        raw = self.load_raw_root_state()
+        return dict(raw), raw
 
     def save_root_state(self, data):
         self._root_state = dict(data)

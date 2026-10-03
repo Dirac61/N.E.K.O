@@ -356,6 +356,26 @@
 
     function translateResponseErrorCode(code, fallbackText) {
         switch (String(code || '').trim()) {
+            case 'migration_already_pending':
+                return translate('storage.migrationAlreadyPending', '请先处理当前迁移或恢复状态，再变更存储位置。');
+            case 'selected_root_empty':
+                return translate('storage.selectedRootEmpty', '目标路径不能为空。');
+            case 'selected_root_not_absolute':
+                return translate('storage.selectedRootNotAbsolute', '目标路径必须是绝对路径。');
+            case 'selected_root_inside_project':
+                return translate('storage.selectedRootInsideProject', '目标路径不能位于项目目录内，请选择其他位置。');
+            case 'selected_root_is_file':
+            case 'selected_root_not_directory':
+                return translate('storage.selectedRootNotDirectory', '目标路径必须是文件夹，不能是文件。');
+            case 'selected_root_parent_missing':
+                return translate('storage.selectedRootParentMissing', '找不到目标路径的父目录，无法创建，请选择其他位置。');
+            case 'selected_root_parent_not_writable':
+                return translate('storage.selectedRootParentNotWritable', '目标路径的父目录不可写，无法创建，请选择其他位置。');
+            case 'selected_root_inside_cloudsave':
+            case 'selected_root_inside_staging':
+            case 'selected_root_inside_backups':
+            case 'selected_root_inside_anchor_root':
+                return translate('storage.selectedRootReserved', '目标路径位于保留的存储区域，请选择其他位置。');
             case 'cloudsave_local_state_unavailable':
                 return translate('storage.cloudsaveLocalStateUnavailable', '本机状态目录不可用，当前会话已禁用云存档。请先修复 state 路径并重启应用，再进行存储位置变更。');
             case 'directory_picker_unavailable':
@@ -401,6 +421,7 @@
             case 'target_not_empty':
                 return translate('storage.targetNotEmpty', '目标路径已经包含运行时数据，请确认目标目录后再继续迁移。');
             case 'target_not_writable':
+            case 'selected_root_not_writable':
                 return translate('storage.blockingTargetNotWritable', '目标路径当前不可写，无法开始迁移流程。');
             default:
                 return fallbackText || '';

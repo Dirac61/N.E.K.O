@@ -32,6 +32,19 @@ for (const locale of ['en', 'ja', 'zh-CN']) {
   assert.strictEqual(format({ ...payload, restart_mode: 'migrate_after_shutdown' }, 'fallback'), messages.storage.restartRollbackFailed);
   assert.strictEqual(format({ ...payload, error_code: 'storage_state_invalid' }, 'fallback'), messages.storage.storageStateInvalid);
   assert.strictEqual(format({ ...payload, error_code: 'startup_release_failed' }, 'fallback'), messages.storage.startupReleaseFailed);
+  for (const [code, key] of [
+    ['migration_already_pending', 'migrationAlreadyPending'],
+    ['selected_root_empty', 'selectedRootEmpty'],
+    ['selected_root_not_absolute', 'selectedRootNotAbsolute'],
+    ['selected_root_inside_project', 'selectedRootInsideProject'],
+    ['selected_root_is_file', 'selectedRootNotDirectory'],
+    ['selected_root_not_directory', 'selectedRootNotDirectory'],
+    ['selected_root_parent_missing', 'selectedRootParentMissing'],
+    ['selected_root_parent_not_writable', 'selectedRootParentNotWritable'],
+    ['selected_root_inside_staging', 'selectedRootReserved'],
+  ]) {
+    assert.strictEqual(format({ ...payload, error_code: code }, 'fallback'), messages.storage[key]);
+  }
   assert.strictEqual(format({ ...payload, error_code: 'unknown_error' }, 'fallback'), 'fallback');
 }
 console.log('Storage error formatting passed for English, Japanese and Simplified Chinese.');
