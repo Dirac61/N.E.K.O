@@ -161,6 +161,10 @@ def test_restart_preserves_raw_checkpoint_on_snapshot_or_shutdown_failure(tmp_pa
     assert response.status_code == 500
     assert response.json()["error_code"] == ("storage_state_unreadable" if unreadable else "restart_schedule_failed")
     assert "private-" not in response.json()["error"]
+    if unreadable:
+        assert "状态文件当前无法读取" in response.json()["error"]
+    else:
+        assert response.json()["error"] == "受控关闭启动失败，请稍后重试。"
     assert original_read(path) == original
     assert manager.load_root_state() == before
     assert len(shutdown_calls) == (0 if unreadable else 1)

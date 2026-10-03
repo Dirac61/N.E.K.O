@@ -2521,7 +2521,11 @@ async def _post_storage_location_restart_locked(
         return {
             "ok": False,
             "error_code": "storage_state_unreadable" if isinstance(exc, _StorageStateUnreadable) else "restart_schedule_failed",
-            "error": "受控关闭启动失败，状态文件可能无法读取，请检查本机状态目录是否可访问后重试。",
+            "error": (
+                "受控关闭启动失败，状态文件当前无法读取，请检查本机状态目录是否可访问后重试。"
+                if isinstance(exc, _StorageStateUnreadable)
+                else "受控关闭启动失败，请稍后重试。"
+            ),
             **restart_preflight,
         }
 
