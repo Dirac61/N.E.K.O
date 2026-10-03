@@ -28,8 +28,9 @@ for (const locale of ['en', 'ja', 'zh-CN']) {
   vm.runInContext(script, context);
   const format = window.appStorageLocation.formatError;
   const payload = { error_code: 'storage_policy_rollback_failed', error: '中文底层异常私有路径' };
-  assert.strictEqual(format({ ...payload, phase: 'startup_release' }, 'fallback'), messages.storage.startupReleaseRollbackFailed);
-  assert.strictEqual(format({ ...payload, restart_mode: 'migrate_after_shutdown' }, 'fallback'), messages.storage.restartRollbackFailed);
+  assert.strictEqual(format({ ...payload, error_code: 'startup_release_rollback_failed' }, 'fallback'), messages.storage.startupReleaseRollbackFailed);
+  assert.strictEqual(format({ ...payload, error_code: 'restart_rollback_failed' }, 'fallback'), messages.storage.restartRollbackFailed);
+  assert.strictEqual(format({ ...payload, error_code: 'storage_operation_failed' }, 'fallback'), messages.storage.storageOperationFailed);
   assert.strictEqual(format({ ...payload, error_code: 'storage_state_invalid' }, 'fallback'), messages.storage.storageStateInvalid);
   assert.strictEqual(format({ ...payload, error_code: 'startup_release_failed' }, 'fallback'), messages.storage.startupReleaseFailed);
   for (const [code, key] of [

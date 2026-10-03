@@ -403,13 +403,15 @@
             case 'startup_release_failed':
                 return translate('storage.startupReleaseFailed', '当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。');
             case 'storage_operation_failed':
-                return translate('storage.selectionSubmitFailed', '提交存储位置选择失败，请稍后重试。');
+                return translate('storage.storageOperationFailed', '提交存储位置操作失败，未发生落盘改动，请稍后重试。');
             case 'storage_bootstrap_blocking':
                 return translate('storage.storageBootstrapBlocking', '当前存储状态仍需恢复或迁移，暂时不能继续当前会话。');
             case 'storage_policy_rollback_failed':
                 return translate('storage.storagePolicyRollbackFailed', '写入存储位置配置失败，且未能恢复原有状态，请检查本机状态目录是否可写；若仍异常请手动确认状态文件。');
-            case 'storage_policy_snapshot_failed':
-                return translate('storage.storagePolicySnapshotFailed', '写入存储位置配置失败，未取得状态快照、未发生落盘改动，请检查本机状态目录是否可写后重试。');
+            case 'startup_release_rollback_failed':
+                return translate('storage.startupReleaseRollbackFailed', '解除受限启动失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
+            case 'restart_rollback_failed':
+                return translate('storage.restartRollbackFailed', '受控重启失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
             case 'storage_policy_write_failed':
                 return translate('storage.storagePolicyWriteFailed', '写入存储位置配置失败，已恢复原有状态，请检查本机状态目录是否可写后重试。');
             case 'storage_state_unreadable':
@@ -1398,12 +1400,6 @@
         if (payload && typeof payload === 'object') {
             var rawError = typeof payload.error === 'string' ? String(payload.error).trim() : '';
             var code = String(payload.error_code || payload.blocking_error_code || '').trim();
-            if (code === 'storage_policy_rollback_failed' && payload.phase === 'startup_release') {
-                return translate('storage.startupReleaseRollbackFailed', '解除受限启动失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
-            }
-            if (code === 'storage_policy_rollback_failed' && payload.restart_mode) {
-                return translate('storage.restartRollbackFailed', '受控重启失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
-            }
             var codedText = translateResponseErrorCode(code, '');
             if (codedText) {
                 return codedText;

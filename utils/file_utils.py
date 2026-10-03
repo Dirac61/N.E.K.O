@@ -758,9 +758,9 @@ def _create_exclusive_temp_file(target_dir: Path) -> tuple[int, str]:
     permanently. This is why this project froze on disk writes in restricted
     environments.
 
-    Here only FileExistsError (random-name collision) is retried; every other
-    OSError is raised immediately, so the caller gets an honest exception
-    instead of an endless wait.
+    FileExistsError and Windows PermissionError on a confirmed existing
+    candidate name are retried within the fixed bound. Other creation errors
+    are raised immediately, so access denial cannot trigger an endless wait.
     """
     target_dir = Path(target_dir).absolute()
     for _ in range(_TMP_CREATE_MAX_TRIES):

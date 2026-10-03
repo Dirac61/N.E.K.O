@@ -949,14 +949,7 @@ class StorageRootsMixin:
         try:
             if tolerate_replace:
                 from utils.file_utils import read_json_tolerating_replace
-
-                try:
-                    return read_json_tolerating_replace(path)
-                except FileNotFoundError:
-                    return deepcopy(default_value)
-                except Exception as exc:
-                    logger.error("加载 JSON 文件失败: path=%s error=%s", path, exc)
-                    raise
+                return self._load_json_file(path, default_value, reader=read_json_tolerating_replace)
             return self._load_json_file(path, default_value)
         except OSError as e:
             self._raise_local_state_file_error(operation, path, str(e), cause=e)
@@ -994,9 +987,11 @@ class StorageRootsMixin:
             "tombstones": [],
         }
 
-    def _load_json_file(self, path, default_value=None):
+    def _load_json_file(self, path, default_value=None, *, reader=None):
         """Load an arbitrary JSON file; returns a copy of the default when the file is missing."""
         try:
+            if reader is not None:
+                return reader(path)
             with open(path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except FileNotFoundError:
@@ -1022,10 +1017,10 @@ class StorageRootsMixin:
 
     def load_root_state_with_raw(self, default_value=None):
         """Return semantic and raw root state derived from the same disk read."""
-        state = self.load_raw_root_state(default_value)
+        state = self.load_raw_root_state(default_value, tolerate_replace=True)
         return self._apply_root_state_recovery_override(state), deepcopy(state)
 
-    def load_raw_root_state(self, default_value=None):
+    def load_raw_root_state(self, default_value=None, *, tolerate_replace=False):
         """Load persisted root_state without applying the runtime recovery override."""
         if default_value is None:
             default_value = self.build_default_root_state()
@@ -1033,7 +1028,7 @@ class StorageRootsMixin:
             self.root_state_path,
             default_value,
             "loading root_state",
-            tolerate_replace=True,
+            tolerate_replace=tolerate_replace,
         )
 
     def save_root_state(self, data):

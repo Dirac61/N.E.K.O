@@ -115,9 +115,8 @@ _storage_mutation_lock = asyncio.Lock()
 #     只有已经拿着 _storage_mutation_lock 的 *_locked 路由才 opt-in 落盘。另外
 #     root_state 有了真锁（utils/root_state_lock.py），读—改—写整段进锁、锁内重读。
 #
-# 仍然刻意留在循环上的只有**回滚**（_restore_storage_mutation_state 及
-# /restart 的两处内联回滚）：它们全在 except handler 里，await 会让回滚自己变成取消
-# 点，而 CancelledError 是 BaseException，外层 except Exception 接不住。
+# 回滚也必须在 worker 中执行：普通写入失败与写入共用同一事务，写入成功后的
+# 屏障/关闭失败恢复经 _run_locked_storage_job 提交，取消时等 worker 终态再传播。
 
 
 class StorageLocationSelectionRequest(BaseModel):
@@ -439,7 +438,7 @@ def _restore_storage_mutation_state_locked(
         root_state_path = Path(getattr(config_manager, "root_state_path", ""))
         try:
             try:
-                current_root_state = config_manager.load_raw_root_state()
+                current_root_state = config_manager.load_raw_root_state(tolerate_replace=True)
             except Exception:
                 current_root_state = None
             if current_root_state == previous_root_state or (
@@ -651,25 +650,12 @@ async def _apply_storage_mutation_writes_or_rollback(
         # 前端只按 error_code 取固定文案、不读响应体里的 error，所以四种结局必须各有
         # 一个错误码，否则用户会据此误判能不能直接重试。
         if not snapshot_out:
-            if not isinstance(exc, OSError):
-                logger.exception("storage operation failed before a snapshot was taken")
-                return None, {
-                    "ok": False,
-                    "error_code": "storage_operation_failed",
-                    "error": "提交存储位置操作失败，未发生落盘改动，请稍后重试。",
-                }
-            # 空快照 = 快照都没取成、一行都没写，跳过回滚（回滚反而会删掉盘上本来就在的
-            # 检查点，见 _restore_storage_mutation_state 开头的守卫）。这里也不能说
-            # 「已恢复」：没有恢复动作，而且走到这条路径正是因为读 root_state 失败，
-            # 我们并没有确认过盘上内容。
-            logger.warning(
-                "[storage_location] 存储位置配置写入失败，未取到快照、无落盘改动，无需回滚: %s",
-                exc,
-            )
+            # 文件读/格式错误已由上面的具体分支处理；其他快照前故障不归因为写权限。
+            logger.exception("storage operation failed before a snapshot was taken")
             return None, {
                 "ok": False,
-                "error_code": "storage_policy_snapshot_failed",
-                "error": "写入存储位置配置失败，未取得状态快照、未发生落盘改动，请检查本机状态目录是否可写后重试。",
+                "error_code": "storage_operation_failed",
+                "error": "提交存储位置操作失败，未发生落盘改动，请稍后重试。",
             }
         # 回滚结果由 _job 写入 snapshot_out["_write_outcome"]：
         #   - "rolled_back"   → 三步全部成功
@@ -752,7 +738,7 @@ async def _release_storage_startup_barrier_result(
         )
     except _StorageRollbackPartialError:
         return 500, {
-            "ok": False, "error_code": "storage_policy_rollback_failed",
+            "ok": False, "error_code": "startup_release_rollback_failed",
             "phase": "startup_release",
             "error": "未能确认原有状态已恢复，请检查状态文件。",
         }
@@ -1685,7 +1671,7 @@ async def _request_shutdown_or_rollback(
         except Exception:
             logger.exception("storage shutdown rollback failed or outcome unknown: %s", restart_mode)
             return {
-                "ok": False, "error_code": "storage_policy_rollback_failed",
+                "ok": False, "error_code": "restart_rollback_failed",
                 "error": "受控关闭启动失败，未能确认原有状态已恢复，请检查状态文件。",
                 "restart_mode": restart_mode, **preflight,
             }

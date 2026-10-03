@@ -1,4 +1,5 @@
 import asyncio
+import builtins
 import json
 import threading
 from pathlib import Path
@@ -269,7 +270,7 @@ def test_restart_reports_partial_rollback_failure(tmp_path, monkeypatch, unexpec
             "selected_root": str(tmp_path / "new-storage" / "N.E.K.O"), "selection_source": "custom",
         })
     assert response.status_code == 500
-    assert response.json()["error_code"] == "storage_policy_rollback_failed"
+    assert response.json()["error_code"] == "restart_rollback_failed"
     assert "private-path" not in response.json()["error"]
     assert response.json()["restart_mode"] == "migrate_after_shutdown"
     assert "private-worker-error" not in response.json()["error"]
@@ -317,7 +318,7 @@ def test_root_snapshot_derives_recovery_from_one_raw_read(tmp_path, monkeypatch)
     manager = _make_real_config_manager(tmp_path)
     raw = manager.load_raw_root_state()
     reads = []
-    def read_once(default_value=None):
+    def read_once(default_value=None, *, tolerate_replace=False):
         reads.append(1)
         return dict(raw)
     monkeypatch.setattr(manager, "load_raw_root_state", read_once)
@@ -343,7 +344,7 @@ def test_barrier_release_reports_failed_rollback(tmp_path, monkeypatch):
             "selected_root": str(manager.app_docs_dir), "selection_source": "current",
         })
     assert response.status_code == 500
-    assert response.json()["error_code"] == "storage_policy_rollback_failed"
+    assert response.json()["error_code"] == "startup_release_rollback_failed"
     assert "private-" not in response.json()["error"]
     assert response.json()["phase"] == "startup_release"
 
@@ -376,6 +377,45 @@ async def test_root_snapshot_and_rollback_tolerate_busy_reads(tmp_path, monkeypa
     assert error["error_code"] == "storage_policy_write_failed"
     assert reads == [1, 1, 1, 1]
     assert writes == []
+
+
+@pytest.mark.unit
+async def test_plain_root_read_does_not_retry_access_denied(tmp_path, monkeypatch):
+    manager = _make_real_config_manager(tmp_path)
+    before = manager.load_raw_root_state()
+    manager.save_root_state(before)
+    original_open = builtins.open
+    reads = []
+    def denied_once(path, *args, **kwargs):
+        if path in (manager.root_state_path, str(manager.root_state_path)):
+            reads.append(1)
+            if len(reads) == 1:
+                error = PermissionError("access denied")
+                error.winerror = 5
+                raise error
+        return original_open(path, *args, **kwargs)
+    monkeypatch.setattr(builtins, "open", denied_once)
+    with pytest.raises(storage_location_router_module.LocalStateDirectoryError):
+        manager.load_root_state()
+    assert reads == [1]
+    reads.clear()
+    semantic, raw = await asyncio.to_thread(manager.load_root_state_with_raw)
+    assert reads == [1, 1]
+    assert semantic == raw == before
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("retry", [False, True])
+def test_json_loader_default_and_missing_contract_is_shared(tmp_path, retry):
+    manager = _make_real_config_manager(tmp_path)
+    reader = file_utils_module.read_json_tolerating_replace if retry else None
+    missing = tmp_path / "missing-state.json"
+    with pytest.raises(FileNotFoundError):
+        manager._load_json_file(missing, reader=reader)
+    default = {"nested": {"value": 1}}
+    restored = manager._load_json_file(missing, default, reader=reader)
+    restored["nested"]["value"] = 2
+    assert default["nested"]["value"] == 1
 
 
 @pytest.mark.unit
@@ -578,7 +618,7 @@ class _DummyConfigManager:
     def load_root_state(self):
         return dict(self._root_state)
 
-    def load_raw_root_state(self):
+    def load_raw_root_state(self, *, tolerate_replace=False):
         return dict(self._root_state)
 
     def load_root_state_with_raw(self):
@@ -2497,7 +2537,7 @@ def test_storage_location_select_reports_snapshot_failure_without_claiming_resto
     assert response.status_code == 500
     payload = response.json()
     assert payload["ok"] is False
-    assert payload["error_code"] == "storage_policy_snapshot_failed"
+    assert payload["error_code"] == "storage_operation_failed"
     # 响应体只给稳定文案，底层异常（含绝对路径）必须留在服务端日志里
     assert "[Errno 13]" not in payload["error"]
     # 快照都没取成，绝不能跑回滚
@@ -2840,7 +2880,7 @@ def test_storage_location_restart_rebind_rolls_back_state_when_shutdown_fails(tm
     assert payload["error_code"] == {
         "shutdown": "restart_schedule_failed", "write": "storage_policy_write_failed",
         "snapshot": "storage_state_unreadable",
-        "rollback": "storage_policy_rollback_failed",
+        "rollback": "restart_rollback_failed",
     }[failure_stage]
     assert "private-" not in payload["error"]
     assert len(restores) == (0 if failure_stage == "snapshot" else 1)
