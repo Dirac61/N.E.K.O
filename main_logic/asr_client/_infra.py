@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
@@ -29,6 +30,12 @@ import numpy as np
 import soxr
 
 from .delivery import delivery_evidence, log_delivery_phase
+from .warmup import (
+    provider_warmup_kind,
+    provider_warmup_reason,
+    provider_warmup_snapshot,
+)
+from .worker_failure import recorded_worker_failure
 from .provider_policy import AsrProviderPolicy
 from .transcript import SegmentAggregator
 
@@ -73,7 +80,7 @@ _OMNI_ONLY_FIELDS = frozenset(
     }
 )
 
-_RequestKind: TypeAlias = Literal["audio", "commit", "clear", "shutdown"]
+_RequestKind: TypeAlias = Literal["audio", "commit", "clear", "shutdown", "activity"]
 _EventKind: TypeAlias = Literal[
     "ready",
     "utterance_started",
@@ -146,6 +153,10 @@ class RealtimeAsrSession(Protocol):
 
     async def signal_user_activity_end(self) -> None: ...
 
+    async def signal_local_activity(self, *, speech_active: bool) -> None: ...
+
+    def signal_local_activity_nowait(self, *, speech_active: bool) -> None: ...
+
     async def clear_audio_buffer(self) -> None: ...
 
     async def close(self) -> None: ...
@@ -160,6 +171,7 @@ class _AsrWorkerRequest:
     buffer_epoch: int = 0
     utterance_id: int | None = None
     audio: bytes = b""
+    speech_active: bool = False
 
 
 @dataclass(slots=True)
@@ -184,6 +196,10 @@ class _AsrRequestQueue(asyncio.Queue[_AsrWorkerRequest]):
         super().__init__()
         self._held_audio_bytes = 0
         self._held_audio_items = 0
+        # A worker may temporarily retire its transport while keeping queued
+        # audio. Recovery gets a time.monotonic() deadline, never a larger
+        # audio budget. This transport contract is provider-neutral.
+        self.transport_recovery_deadline = 0.0
 
     def hold_dequeued_audio(
         self,
@@ -201,7 +217,7 @@ class _AsrRequestQueue(asyncio.Queue[_AsrWorkerRequest]):
     ) -> tuple[_AsrWorkerRequest, _QueuedAudioHold | None]:
         """Atomically transfer dequeued audio into the held budget."""
 
-        request = await super().get()
+        request = await self.get()
         return request, self.hold_dequeued_audio(request)
 
     def _release_held_audio(self, audio_bytes: int) -> None:
@@ -400,6 +416,10 @@ class _RealtimeAsrSessionImpl:
         self._closing_event = asyncio.Event()
         self._callback_close_event = asyncio.Event()
         self._connection_error_reported = False
+        # "<ASR_CODE>: <message>" of the failure that ended the session, so a
+        # failure right after "ready" still reaches connect()'s caller with
+        # its provider code instead of a generic one.
+        self._failure_error: str | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -422,6 +442,21 @@ class _RealtimeAsrSessionImpl:
         """Audio payload bytes after successful socket send, not queue admission."""
         evidence = getattr(self._request_queue, "_transport_delivery_evidence", None)
         return evidence.written_audio_bytes if evidence else 0
+
+    @property
+    def provider_warmup_kind(self) -> str:
+        """What a pending warm-up waits for (``"model"`` / ``"queue"``), or ``""``."""
+        return provider_warmup_kind(self._request_queue)
+
+    @property
+    def provider_warmup_reason(self) -> str:
+        """Why the provider is preparing (an ``ASR_*`` code), or ``""``."""
+        return provider_warmup_reason(self._request_queue)
+
+    @property
+    def provider_warmup_snapshot(self) -> tuple[bool, float | None]:
+        """``(pending, completed_at)`` taken together; see provider_warmup_snapshot()."""
+        return provider_warmup_snapshot(self._request_queue)
 
     @property
     def transport_delivery_trace_id(self) -> str | None:
@@ -500,13 +535,31 @@ class _RealtimeAsrSessionImpl:
 
             worker_task = self._worker_task
             if self._state is not _SessionState.READY or worker_task is None:
-                raise RuntimeError("ASR_WORKER_FAILED: worker exited during connect")
-            if worker_task.done():
-                await self._fail(
-                    "ASR_WORKER_FAILED",
-                    "worker exited immediately after becoming ready",
+                recorded = recorded_worker_failure(self._request_queue)
+                raise RuntimeError(
+                    getattr(self, "_failure_error", None)
+                    or (f"{recorded[0]}: {recorded[1]}" if recorded else None)
+                    or "ASR_WORKER_FAILED: worker exited during connect"
                 )
-                raise RuntimeError("ASR_WORKER_FAILED: worker exited during connect")
+            if worker_task.done():
+                # The worker may have queued its own failure (e.g. a local
+                # model that failed to load) just before returning: keep that
+                # code instead of classifying the exit generically.
+                recorded = recorded_worker_failure(self._request_queue)
+                if recorded is not None:
+                    await self._fail(
+                        recorded[0] or "ASR_WORKER_FAILED",
+                        recorded[1] or "worker reported a provider error",
+                    )
+                else:
+                    await self._fail(
+                        "ASR_WORKER_FAILED",
+                        "worker exited immediately after becoming ready",
+                    )
+                raise RuntimeError(
+                    getattr(self, "_failure_error", None)
+                    or "ASR_WORKER_FAILED: worker exited during connect"
+                )
             if self._voice_turn_factory is not None:
                 adapter: _VoiceTurnAdapterProtocol | None = None
                 try:
@@ -641,6 +694,38 @@ class _RealtimeAsrSessionImpl:
             ):
                 return
             await self._commit_current_utterance_locked()
+
+    async def signal_local_activity(self, *, speech_active: bool) -> None:
+        """Forward observational VAD hints without sealing a logical turn."""
+        if self._provider_policy is None or not self._provider_policy.observes_local_activity:
+            return
+        async with self._operation_lock:
+            # Lock acquisition orders pauses behind preceding PCM. Once held,
+            # publish atomically: a child put Task could otherwise run after
+            # cancellation and overtake a newer synchronous resume.
+            self.signal_local_activity_nowait(speech_active=speech_active)
+
+    def signal_local_activity_nowait(self, *, speech_active: bool) -> None:
+        """Submit an observation without waiting behind PCM backpressure.
+
+        The control queue is unbounded. There is no suspension between checking
+        the owner and capturing its generation/epoch; this cannot seal or clear
+        audio and does not need the stream operation lock.
+        """
+        if (
+            self._provider_policy is None
+            or not self._provider_policy.observes_local_activity
+            or self._state is not _SessionState.READY
+            or self._closing_event.is_set()
+            or self._request_queue is None
+            or self._worker_task is None
+            or self._worker_task.done()
+        ):
+            return
+        self._request_queue.put_nowait(_AsrWorkerRequest(
+            kind="activity", generation=self._generation,
+            buffer_epoch=self._buffer_epoch, speech_active=speech_active,
+        ))
 
     async def clear_audio_buffer(self) -> None:
         async with self._operation_lock:
@@ -1518,6 +1603,7 @@ class _RealtimeAsrSessionImpl:
         )
         safe_message = self._sanitize_error(message)
         error = f"{safe_code}: {safe_message}"
+        self._failure_error = error
         if self._ready_future is not None and not self._ready_future.done():
             self._ready_future.set_exception(RuntimeError(error))
         if (
@@ -1573,8 +1659,7 @@ class _RealtimeAsrSessionImpl:
         self,
         request: _AsrWorkerRequest,
     ) -> None:
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _REQUEST_BACKPRESSURE_TIMEOUT_SECONDS
+        deadline = time.monotonic() + _REQUEST_BACKPRESSURE_TIMEOUT_SECONDS
         while (
             self._queued_audio_bytes() + len(request.audio)
             > _ACTIVE_QUEUE_MAX_AUDIO_BYTES
@@ -1582,7 +1667,13 @@ class _RealtimeAsrSessionImpl:
         ):
             if self._closing_event.is_set() or self._state is not _SessionState.READY:
                 raise RuntimeError("ASR_SESSION_NOT_READY: session is not ready")
-            remaining = deadline - loop.time()
+            remaining = deadline - time.monotonic()
+            recovery_deadline = (
+                self._request_queue.transport_recovery_deadline
+                if isinstance(self._request_queue, _AsrRequestQueue) else 0.0
+            )
+            if recovery_deadline > time.monotonic():
+                remaining = max(deadline, recovery_deadline) - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(
                     "ASR_STREAM_BACKPRESSURE: active audio queue exceeded "

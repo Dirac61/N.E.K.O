@@ -257,6 +257,8 @@ export default {
     packageHashMismatch: 'Plugin package verification failed.',
     downloadFailed: 'The plugin package download failed.',
     marketListFetchFailed: 'The Plugin Market is temporarily unavailable.',
+    catalogNotConfigured: 'The Plugin Market address is not configured.',
+    releaseMismatch: 'The install request does not match the Market release record. Refresh the Plugin Market and try again.',
     unsafeProfilePath: 'The recorded package profile path is unsafe.',
     packageIdentityMismatch: 'The package identity does not match the target plugin.',
     confirmationChanged: 'The plugin or package changed after confirmation. Review the new plan and try again.',
@@ -821,6 +823,7 @@ export default {
     serviceUnavailable: 'Service unavailable',
     networkError: 'Network error. Please check your connection.',
     requestTimeout: 'The request timed out. Please try again.',
+    csrfBootstrapFailed: 'Could not obtain the security token. If you use a reverse proxy, make sure it forwards /security/csrf-token to the plugin server.',
     pluginLifecycleTimeout: 'Plugin startup or restart timed out. Please check the plugin logs.'
   },
   welcome: {

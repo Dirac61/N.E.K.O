@@ -58,6 +58,25 @@ function getAvatarNavigationWindowFeatures(finalUrl) {
     return undefined;
 }
 
+// 声纹运行模式在进程启动时固定；拿不到状态时保留入口，由后端拒绝写操作。
+// off 模式下仍有已存声纹或过滤请求时保留入口，让用户能关闭过滤或删除声纹。
+function hideAvatarVoiceIdentityEntryWhenDisabled(menuItem) {
+    if (!menuItem || typeof fetch !== 'function') return;
+    fetch('/api/voice-identity/status', { cache: 'no-store' })
+        .then(response => (response.ok ? response.json() : null))
+        .then(status => {
+            if (
+                status
+                && status.runtime_mode === 'off'
+                && status.has_profile !== true
+                && status.requested_enabled !== true
+            ) {
+                menuItem.style.display = 'none';
+            }
+        })
+        .catch(() => { });
+}
+
 function clearAvatarSidePanelHoverState(panel) {
     if (!panel) return;
     if (panel._collapseTimeout) { clearTimeout(panel._collapseTimeout); panel._collapseTimeout = null; }
@@ -75,6 +94,8 @@ function applyAvatarSidePanelTransform(panel, motion = 'none') {
 }
 
 function getAvatarSidePanelExitMotion(panel) {
+    if (panel && panel.dataset && panel.dataset.placement === 'above') return 'translateY(6px)';
+    if (panel && panel.dataset && panel.dataset.placement === 'compact') return 'none';
     if (panel && panel.dataset && panel.dataset.goDown === 'true') return 'translateY(-6px)';
     return panel && panel.dataset && panel.dataset.goLeft === 'true'
         ? 'translateX(6px)'
@@ -395,7 +416,8 @@ function createPopup(manager, prefix, buttonId) {
 
     if (buttonId === 'mic') {
         popup.setAttribute('data-legacy-id', `${prefix}-mic-popup`);
-        popup.style.minWidth = '400px';
+        // The audio renderer owns the voice menu's width, including callers
+        // that create the popup without this shared factory.
         popup.style.maxHeight = '420px';
         popup.style.flexDirection = 'row';
         popup.style.gap = '0';
@@ -3237,6 +3259,9 @@ const AvatarPopupMixin = {
             settingsItems.forEach(item => {
                 const menuItem = this._createMenuItem(item);
                 popup.appendChild(menuItem);
+                if (item.id === 'voice-identity') {
+                    hideAvatarVoiceIdentityEntryWhenDisabled(menuItem);
+                }
             });
         };
 

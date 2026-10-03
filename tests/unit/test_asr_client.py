@@ -145,6 +145,7 @@ def test_public_exports_are_frozen():
         "VoiceIdentityActivationResult",
         "create_asr_session",
         "get_asr_core_capabilities",
+        "is_local_asr_available",
     ]
     assert not hasattr(asr_client, "get_asr_worker")
     assert not hasattr(asr_client, "AsrWorkerFn")
@@ -222,6 +223,7 @@ def test_phase2_registry_routes_and_capabilities():
         "glm",
         "gemini",
         "soniox",
+        "faster_whisper",
     }
     assert CORE_ASR_ROUTES["qwen"].provider_key == "qwen"
     assert CORE_ASR_ROUTES["qwen"].credential_field == "ASSIST_API_KEY_QWEN"
@@ -708,7 +710,10 @@ def test_provider_endpoint_does_not_install_smart_turn_factory(monkeypatch):
     assert session._voice_turn_factory is None
 
 
-def test_endpointing_contract_is_provider_neutral_and_route_defaulted(monkeypatch):
+@pytest.mark.parametrize("qwen_core", ["qwen", "qwen_intl"])
+def test_endpointing_contract_is_provider_neutral_and_route_defaulted(monkeypatch, qwen_core):
+    from main_logic.asr_client.workers.qwen import _qwen_session_update
+
     callback = AsyncMock()
     observed_modes: list[tuple[str, str]] = []
 
@@ -729,7 +734,7 @@ def test_endpointing_contract_is_provider_neutral_and_route_defaulted(monkeypatc
         on_connection_error=callback,
     )
     qwen_session = create_asr_session(
-        "qwen",
+        qwen_core,
         on_input_transcript=callback,
         on_connection_error=callback,
     )
@@ -738,7 +743,9 @@ def test_endpointing_contract_is_provider_neutral_and_route_defaulted(monkeypatc
     assert qwen_session._config.endpointing_mode == "provider"
     assert grok_session._voice_turn_factory is None
     assert qwen_session._voice_turn_factory is None
-    assert observed_modes == [("grok", "provider"), ("qwen", "provider")]
+    assert observed_modes == [("grok", "provider"), (qwen_core, "provider")]
+    assert not resolve_provider_policy("qwen", qwen_session._config.endpointing_mode).smart_turn_required
+    assert _qwen_session_update(qwen_session._config, language="zh")["session"]["turn_detection"] == {"type": "server_vad"}
     with pytest.raises(ValueError, match="manual.*provider"):
         AsrSessionConfig(endpointing_mode="server_vad")
 

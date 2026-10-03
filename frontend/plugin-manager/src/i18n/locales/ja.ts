@@ -257,6 +257,8 @@ export default {
     packageHashMismatch: 'プラグインパッケージの検証に失敗しました。',
     downloadFailed: 'プラグインパッケージのダウンロードに失敗しました。',
     marketListFetchFailed: 'プラグイン Market は一時的に利用できません。',
+    catalogNotConfigured: 'プラグイン Market のアドレスが設定されていません。',
+    releaseMismatch: 'インストール要求が Market の公開記録と一致しません。プラグイン Market を再読み込みしてから再試行してください。',
     unsafeProfilePath: '記録されたパッケージ Profile のパスは安全ではありません。',
     packageIdentityMismatch: 'パッケージ ID が対象プラグインと一致しません。',
     confirmationChanged: '確認後にプラグインまたはパッケージが変更されました。新しい計画を確認してください。',
@@ -821,6 +823,7 @@ export default {
     serviceUnavailable: 'サービスが利用できません',
     networkError: 'ネットワークエラー。接続を確認してください。',
     requestTimeout: 'リクエストがタイムアウトしました。もう一度お試しください。',
+    csrfBootstrapFailed: 'セキュリティトークンを取得できませんでした。リバースプロキシを使用している場合は、/security/csrf-token がプラグインサーバーに転送されているか確認してください。',
     pluginLifecycleTimeout: 'プラグインの起動または再起動がタイムアウトしました。プラグインログを確認してください。'
   },
   welcome: {

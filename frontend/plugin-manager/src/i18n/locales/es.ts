@@ -257,6 +257,8 @@ export default {
     packageHashMismatch: 'Falló la verificación del paquete del plugin.',
     downloadFailed: 'Falló la descarga del paquete del plugin.',
     marketListFetchFailed: 'El Market de plugins no está disponible temporalmente.',
+    catalogNotConfigured: 'La dirección del Market de plugins no está configurada.',
+    releaseMismatch: 'La solicitud de instalación no coincide con el registro de publicación del Market. Actualiza el Market de plugins e inténtalo de nuevo.',
     unsafeProfilePath: 'La ruta registrada del perfil del paquete no es segura.',
     packageIdentityMismatch: 'La identidad del paquete no coincide con el plugin de destino.',
     confirmationChanged: 'El plugin o el paquete cambió después de confirmar. Revisa el nuevo plan.',
@@ -821,6 +823,7 @@ export default {
     serviceUnavailable: 'Servicio no disponible',
     networkError: 'Error de red. Comprueba tu conexión.',
     requestTimeout: 'La solicitud agotó el tiempo de espera. Inténtalo de nuevo.',
+    csrfBootstrapFailed: 'No se pudo obtener el token de seguridad. Si usas un proxy inverso, asegúrate de que reenvíe /security/csrf-token al servidor de plugins.',
     pluginLifecycleTimeout: 'El inicio o reinicio del plugin agotó el tiempo de espera. Revisa los registros del plugin.'
   },
   welcome: {

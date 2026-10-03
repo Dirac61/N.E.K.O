@@ -257,6 +257,8 @@ export default {
     packageHashMismatch: '插件包校验失败。',
     downloadFailed: '插件包下载失败。',
     marketListFetchFailed: '插件市场暂时不可用。',
+    catalogNotConfigured: '未配置插件市场地址。',
+    releaseMismatch: '安装请求与市场发布记录不一致，请刷新插件市场后重试。',
     unsafeProfilePath: '记录的包 Profile 路径不安全。',
     packageIdentityMismatch: '插件包身份与目标插件不一致。',
     confirmationChanged: '确认后插件或安装包已变化，请检查新计划后重试。',
@@ -821,6 +823,7 @@ export default {
     serviceUnavailable: '服务不可用',
     networkError: '网络错误，请检查网络连接',
     requestTimeout: '请求超时，请稍后重试',
+    csrfBootstrapFailed: '无法获取安全令牌。如使用反向代理，请确认已将 /security/csrf-token 转发到插件服务。',
     pluginLifecycleTimeout: '插件启动或重载超时，请查看插件日志'
   },
   welcome: {
