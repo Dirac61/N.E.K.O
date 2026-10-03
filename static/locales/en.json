@@ -2322,6 +2322,7 @@
         "storageStateUnreadable": "Failed to write the storage location configuration. The state file cannot be read right now (it may not exist, or its directory may be inaccessible) and nothing was written to disk; try again later or check whether the local state directory is accessible.",
         "storageStateInvalid": "The storage state file is corrupt or has an invalid format. Nothing was written to disk; check or restore the state file.",
         "restartRollbackFailed": "The controlled restart failed and restoration of the previous state could not be confirmed. Check or restore the state files.",
+        "startupReleaseFailed": "This session could not leave restricted startup mode. Try again or refresh the page before continuing.",
         "targetNotEmpty": "The target already contains runtime data. Confirm the target before migration.",
         "systemStatusUnavailable": "The local service status could not be confirmed. Please try again.",
         "systemStatusUnexpected": "The storage startup status API returned an unrecognized result.",

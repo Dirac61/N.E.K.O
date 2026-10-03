@@ -2322,6 +2322,7 @@
         "storageStateUnreadable": "写入存储位置配置失败：状态文件当前无法读取（可能不存在，或所在目录不可访问），未发生落盘改动，请稍后重试或检查本机状态目录是否可访问。",
         "storageStateInvalid": "存储状态文件内容损坏或格式无效，未发生落盘改动，请检查或恢复状态文件。",
         "restartRollbackFailed": "受控重启失败且未能确认原有状态已恢复，请检查或恢复状态文件。",
+        "startupReleaseFailed": "当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。",
         "targetNotEmpty": "目标路径已经包含运行时数据，请确认目标目录后再继续迁移。",
         "systemStatusUnavailable": "暂时无法确认本地服务状态，请重试。",
         "systemStatusUnexpected": "存储启动状态接口返回了未识别的结果。",

@@ -381,6 +381,7 @@
             case 'selected_root_unavailable':
                 return translate('storage.selectedRootUnavailable', '原始数据路径当前仍不可用，请先恢复该路径后再重试。');
             case 'startup_release_failed':
+                return translate('storage.startupReleaseFailed', '当前会话暂时无法解除受限启动，请重试或刷新页面后再继续。');
             case 'storage_operation_failed':
                 return translate('storage.selectionSubmitFailed', '提交存储位置选择失败，请稍后重试。');
             case 'storage_bootstrap_blocking':
