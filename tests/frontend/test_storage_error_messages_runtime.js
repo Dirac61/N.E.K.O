@@ -6,7 +6,11 @@ const vm = require('vm');
 const root = path.resolve(__dirname, '../..');
 const script = fs.readFileSync(path.join(root, 'static/app/app-storage-location.js'), 'utf8');
 const template = fs.readFileSync(path.join(root, 'templates/memory_browser.html'), 'utf8');
-assert(template.indexOf('app-storage-location.js') < template.indexOf('memory_browser.js'));
+const formatterPosition = template.indexOf('app-storage-location.js');
+const browserPosition = template.indexOf('memory_browser.js');
+assert(formatterPosition >= 0, 'Shared storage formatter must be loaded.');
+assert(browserPosition >= 0, 'Memory browser script must be loaded.');
+assert(formatterPosition < browserPosition, 'Shared formatter must load before the memory browser.');
 
 for (const locale of ['en', 'ja', 'zh-CN']) {
   const messages = JSON.parse(fs.readFileSync(path.join(root, `static/locales/${locale}.json`), 'utf8'));
