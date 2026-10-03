@@ -935,7 +935,7 @@ def test_sweeper_is_thread_safe_for_the_same_target(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows directory collision semantics")
-def test_windows_permission_collision_retries_but_directory_denial_does_not(tmp_path, monkeypatch):
+def test_windows_permission_collision_retries_but_directory_denial_does_not(tmp_path, monkeypatch, caplog):
     real_open = file_utils.os.open
     attempts = []
 
@@ -960,6 +960,7 @@ def test_windows_permission_collision_retries_but_directory_denial_does_not(tmp_
     with pytest.raises(PermissionError):
         file_utils._create_exclusive_temp_file(tmp_path)
     assert len(attempts) == 3
+    assert "临时文件创建失败" in caplog.text
 
 
 def test_read_json_raises_on_missing_file(tmp_path):

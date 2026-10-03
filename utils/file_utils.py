@@ -771,14 +771,18 @@ def _create_exclusive_temp_file(target_dir: Path) -> tuple[int, str]:
         except FileExistsError:
             # 极低概率的随机名撞车：换一个名字重试，这是唯一该重试的情形。
             continue
-        except PermissionError:
+        except PermissionError as exc:
             # Windows 对目录撞名也可能返回 EACCES。仅确认候选名已存在时重试，
             # 不能用父目录的静态可写权限推断；重试仍受统一上界限制。
             if os.name == "nt" and os.path.lexists(temp_path):
                 continue
+            logger.warning(
+                "[file_utils] 临时文件创建失败，本次写入放弃: dir=%s errno=%s error=%s",
+                target_dir, getattr(exc, "errno", None), exc,
+            )
             raise
         except OSError as exc:
-            # 权限拒绝、目录被删、磁盘满、路径过长……全部落到这里，直接抛出。
+            # 目录被删、磁盘满、路径过长等其他错误，直接抛出。
             # 这里是本次修复的核心：不再重试，也就不会再出现无限循环。
             logger.warning(
                 "[file_utils] 临时文件创建失败，本次写入放弃: dir=%s errno=%s error=%s",
