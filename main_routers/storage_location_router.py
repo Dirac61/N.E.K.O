@@ -262,8 +262,13 @@ class _StorageRollbackPartialError(RuntimeError):
         self.failures = failures
 
 
-class _StorageStateInvalid(_StorageStateUnreadable):
+class _StorageStateInvalid(RuntimeError):
     """Root state bytes cannot be decoded as a JSON object."""
+
+    def __init__(self, path: Path, cause: BaseException):
+        super().__init__(f"storage state file has invalid JSON or schema: {path}")
+        self.path = Path(path)
+        self.cause = cause
 
 
 def _read_state_file_preimage(path: Path) -> dict[str, Any]:
@@ -368,10 +373,9 @@ def _restore_state_file_from_preimage(path: Path, preimage: dict[str, Any]) -> N
 
         atomic_write_bytes(path, raw)
         return
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
+    from utils.file_utils import unlink_tolerating_replace
+
+    unlink_tolerating_replace(path, missing_ok=True)
 
 
 def _restore_storage_mutation_state(
@@ -451,28 +455,20 @@ def _restore_storage_mutation_state_locked(
         # root_state 不做字节快照（回滚要写回的是「原路径不可用」覆盖后的合成状态），
         # 改用加载值比较：盘上已是快照里的值就跳过写入，理由同
         # _restore_state_file_from_preimage —— 不写就不可能失败。
-        # 读—改—写必须整段进 root_state_transaction()：只让 save_root_state 内部那把
-        # 锁是不够的，读和写之间第三方可能插入，把 pre-image 改了之后被我们整份盖掉。
-        # 本函数通常由 _job 在事务内调用（重入锁，安全），但也可能被屏障释放路径单独
-        # 调用，所以这里也要显式取锁。
+        # 公共恢复入口已持有 root_state_transaction，覆盖整段读取和恢复写入。
         root_state_path = Path(getattr(config_manager, "root_state_path", ""))
         try:
-            with root_state_transaction():
-                try:
-                    load_raw_state = getattr(
-                        config_manager, "load_raw_root_state", config_manager.load_root_state
-                    )
-                    # 比较真实磁盘状态；合成恢复状态既不能证明已恢复，也不能证明未恢复。
-                    current_root_state = load_raw_state()
-                except Exception:
-                    # 读不出来就无法确认是否已恢复 → 不跳过，照常写回（写不动时仍会抛）
-                    current_root_state = None
-                if current_root_state == previous_root_state or (
-                    "root_state_raw" in snapshot and current_root_state == snapshot["root_state_raw"]
-                ):
-                    logger.info("[storage_location] root_state 已是快照内容，跳过回滚写入")
-                else:
-                    config_manager.save_root_state(previous_root_state)
+            try:
+                load_raw_state = getattr(config_manager, "load_raw_root_state", config_manager.load_root_state)
+                current_root_state = load_raw_state()
+            except Exception:
+                current_root_state = None
+            if current_root_state == previous_root_state or (
+                "root_state_raw" in snapshot and current_root_state == snapshot["root_state_raw"]
+            ):
+                logger.info("[storage_location] root_state 已是快照内容，跳过回滚写入")
+            else:
+                config_manager.save_root_state(previous_root_state)
         except Exception as exc:
             logger.exception(
                 "[storage_location] 回滚 root_state 失败: %s",
@@ -640,14 +636,13 @@ async def _apply_storage_mutation_writes_or_rollback(
                     )
                 )
         raise
+    except _StorageStateInvalid as exc:
+        logger.warning("invalid storage root state: %s", exc.path)
+        return None, {
+            "ok": False, "error_code": "storage_state_invalid",
+            "error": "存储状态文件内容损坏或格式无效，未发生落盘改动，请检查或恢复状态文件。",
+        }
     except _StorageStateUnreadable as exc:
-        if isinstance(exc, _StorageStateInvalid):
-            logger.warning("invalid storage root state: %s", exc.path)
-            return None, {
-                "ok": False,
-                "error_code": "storage_state_invalid",
-                "error": "存储状态文件内容损坏或格式无效，未发生落盘改动，请检查或恢复状态文件。",
-            }
         # 状态文件当前读不出原始字节（权限拒绝、被别的进程占用、路径是目录、目录不可访问、I/O 错误）。
         # 只有 FileNotFoundError 才算「不存在」，所以这里无法确认文件到底在不在。
         # 快照阶段就终止了：write() 一行都没跑，盘上内容与请求前完全一致。所以这里既不回滚、
@@ -782,6 +777,7 @@ async def _release_storage_startup_barrier_result(
     except _StorageRollbackPartialError:
         return 500, {
             "ok": False, "error_code": "storage_policy_rollback_failed",
+            "phase": "startup_release",
             "error": "未能确认原有状态已恢复，请检查状态文件。",
         }
     except Exception:
@@ -1693,6 +1689,38 @@ async def _request_app_shutdown(request_app_shutdown) -> None:
             raise
 
 
+async def _request_shutdown_or_rollback(
+    config_manager, request_app_shutdown, *, snapshot: dict[str, Any],
+    anchor_root: Path, restart_mode: str, preflight: dict[str, Any],
+) -> dict[str, Any] | None:
+    restore = partial(_restore_storage_mutation_state, config_manager, snapshot, anchor_root=anchor_root)
+    try:
+        await _request_app_shutdown(request_app_shutdown)
+    except _ShutdownAcceptedCancellation:
+        raise
+    except asyncio.CancelledError:
+        with suppress(Exception, asyncio.CancelledError):
+            await _run_locked_storage_job(restore)
+        raise
+    except Exception:
+        logger.exception("failed to schedule storage shutdown: %s", restart_mode)
+        try:
+            await _run_locked_storage_job(restore)
+        except Exception:
+            logger.exception("storage shutdown rollback failed or outcome unknown: %s", restart_mode)
+            return {
+                "ok": False, "error_code": "storage_policy_rollback_failed",
+                "error": "受控关闭启动失败，未能确认原有状态已恢复，请检查状态文件。",
+                "restart_mode": restart_mode, **preflight,
+            }
+        return {
+            "ok": False, "error_code": "restart_schedule_failed",
+            "error": "受控关闭启动失败，请稍后重试。",
+            "restart_mode": restart_mode, **preflight,
+        }
+    return None
+
+
 @router.get("/bootstrap")
 async def get_storage_location_bootstrap(response: Response):
     _set_no_cache_headers(response)
@@ -2348,61 +2376,13 @@ async def _post_storage_location_restart_locked(
         if write_error is not None:
             response.status_code = 500
             return {**write_error, "restart_mode": "rebind_only", **restart_preflight}
-        try:
-            await _request_app_shutdown(request_app_shutdown)
-        except _ShutdownAcceptedCancellation:
-            # Shutdown 已经被 launcher 接受；保留本次写入，让退出后的接力流程执行。
-            raise
-        except asyncio.CancelledError:
-            # 取消也必须回滚。工作线程已经跑完（_run_locked_storage_job 保证了这点），
-            # 也就是说检查点 / 策略 / maintenance_readonly 都已经落盘，而 shutdown
-            # 尚未被接受——留着就是把应用钉死在受限态，用户看到一个永远不重启的
-            # "正在迁移"。
-            # CancelledError 是 BaseException，下面的 except Exception 接不住，所以
-            # 必须单列。回滚 worker 即使再收到取消也会先跑到终态。
-            if state_snapshot:
-                with suppress(Exception, asyncio.CancelledError):
-                    await _run_locked_storage_job(
-                        partial(
-                            _restore_storage_mutation_state,
-                            config_manager,
-                            state_snapshot,
-                            anchor_root=anchor_root,
-                        )
-                    )
-            raise
-        except Exception:
-            logger.exception("failed to schedule storage rebind shutdown")
-            try:
-                await _run_locked_storage_job(
-                    partial(
-                        _restore_storage_mutation_state,
-                        config_manager,
-                        state_snapshot,
-                        anchor_root=anchor_root,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "failed to rollback storage mutation state after restart scheduling failed",
-                )
-                response.status_code = 500
-                return {
-                    "ok": False,
-                    "error_code": "storage_policy_rollback_failed",
-                    "error": "受控关闭启动失败，未能确认原有状态已恢复，请检查状态文件。",
-                    "restart_mode": "rebind_only",
-                    **restart_preflight,
-                }
-
+        shutdown_error = await _request_shutdown_or_rollback(
+            config_manager, request_app_shutdown, snapshot=state_snapshot,
+            anchor_root=anchor_root, restart_mode="rebind_only", preflight=restart_preflight,
+        )
+        if shutdown_error is not None:
             response.status_code = 500
-            return {
-                "ok": False,
-                "error_code": "restart_schedule_failed",
-                "error": "受控关闭启动失败，请稍后重试。",
-                "restart_mode": "rebind_only",
-                **restart_preflight,
-            }
+            return shutdown_error
         return {
             "ok": True,
             "result": "restart_initiated",
@@ -2466,56 +2446,13 @@ async def _post_storage_location_restart_locked(
     if write_error is not None:
         response.status_code = 500
         return {**write_error, "restart_mode": "migrate_after_shutdown", **restart_preflight}
-    try:
-        await _request_app_shutdown(request_app_shutdown)
-    except _ShutdownAcceptedCancellation:
-        # Shutdown 已经被 launcher 接受；待迁移检查点正是退出后的接力依据。
-        raise
-    except asyncio.CancelledError:
-        # 同上：写已落盘、shutdown 尚未被接受，不回滚就会留下一个没人执行的
-        # 待迁移检查点 + maintenance_readonly。rollback_state 为空 = 什么都还没写。
-        if rollback_state:
-            with suppress(Exception, asyncio.CancelledError):
-                await _run_locked_storage_job(
-                    partial(
-                        _restore_storage_mutation_state,
-                        config_manager,
-                        rollback_state,
-                        anchor_root=anchor_root,
-                    )
-                )
-        raise
-    except Exception:
-        logger.exception("failed to schedule storage migration shutdown")
-        # 写入阶段已由共享入口处理，这里只处理写入成功后的关闭失败。
-        if rollback_state:
-            try:
-                await _run_locked_storage_job(
-                    partial(
-                        _restore_storage_mutation_state,
-                        config_manager,
-                        rollback_state,
-                        anchor_root=anchor_root,
-                    )
-                )
-            except Exception:
-                logger.exception("failed to restore storage restart schedule")
-                response.status_code = 500
-                return {
-                    "ok": False,
-                    "error_code": "storage_policy_rollback_failed",
-                    "error": "受控关闭启动失败，且未能恢复原有状态，请检查本机状态目录是否可写。",
-                    "restart_mode": "migrate_after_shutdown",
-                    **restart_preflight,
-                }
+    shutdown_error = await _request_shutdown_or_rollback(
+        config_manager, request_app_shutdown, snapshot=rollback_state,
+        anchor_root=anchor_root, restart_mode="migrate_after_shutdown", preflight=restart_preflight,
+    )
+    if shutdown_error is not None:
         response.status_code = 500
-        return {
-            "ok": False,
-            "error_code": "restart_schedule_failed",
-            "error": "受控关闭启动失败，请稍后重试。",
-            "restart_mode": "migrate_after_shutdown",
-            **restart_preflight,
-        }
+        return shutdown_error
 
     return {
         "ok": True,

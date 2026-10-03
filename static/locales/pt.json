@@ -2323,6 +2323,7 @@
         "storageStateInvalid": "O arquivo de estado de armazenamento está corrompido ou tem um formato inválido. Nada foi gravado no disco; verifique ou restaure o arquivo de estado.",
         "restartRollbackFailed": "A reinicialização controlada falhou e não foi possível confirmar a restauração do estado anterior. Verifique ou restaure os arquivos de estado.",
         "startupReleaseFailed": "Esta sessão não conseguiu sair do modo de inicialização restrita. Tente novamente ou atualize a página antes de continuar.",
+        "startupReleaseRollbackFailed": "Não foi possível sair do modo de inicialização restrita nem confirmar a restauração do estado anterior. Verifique ou restaure os arquivos de estado.",
         "targetNotEmpty": "O destino já contém dados de execução. Confirme o destino antes da migração.",
         "systemStatusUnavailable": "Não foi possível confirmar o status do serviço local. Tente novamente.",
         "systemStatusUnexpected": "A API de status de inicialização do armazenamento retornou um resultado não reconhecido.",

@@ -301,6 +301,68 @@ def test_barrier_release_reports_failed_rollback(tmp_path, monkeypatch):
     assert response.status_code == 500
     assert response.json()["error_code"] == "storage_policy_rollback_failed"
     assert "private-" not in response.json()["error"]
+    assert response.json()["phase"] == "startup_release"
+
+
+@pytest.mark.unit
+async def test_root_snapshot_and_rollback_tolerate_busy_reads(tmp_path, monkeypatch):
+    manager = _make_real_config_manager(tmp_path)
+    manager.save_root_state(manager.load_raw_root_state())
+    original_read = file_utils_module.read_json
+    reads = []
+    writes = []
+    def busy_read(path, **kwargs):
+        if Path(path) == manager.root_state_path:
+            reads.append(1)
+            if len(reads) in (1, 3):
+                exc = PermissionError("sharing violation")
+                exc.winerror = 32
+                raise exc
+        return original_read(path, **kwargs)
+    def deny_root_write(*args, **kwargs):
+        writes.append(1)
+        raise PermissionError("directory not writable")
+    def deny_mutation():
+        raise PermissionError("initial write denied")
+    monkeypatch.setattr(file_utils_module, "read_json", busy_read)
+    monkeypatch.setattr(manager, "save_root_state", deny_root_write)
+    _, error = await storage_location_router_module._apply_storage_mutation_writes_or_rollback(
+        manager, anchor_root=manager.anchor_root, snapshot_out={}, write=deny_mutation,
+    )
+    assert error["error_code"] == "storage_policy_write_failed"
+    assert reads == [1, 1, 1, 1]
+    assert writes == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("override", [False, True])
+def test_raw_root_snapshot_is_not_aliased_to_semantic_state(tmp_path, monkeypatch, override):
+    manager = _make_real_config_manager(tmp_path)
+    manager.save_root_state({**manager.load_raw_root_state(), "nested": {"value": 1}})
+    monkeypatch.setattr(manager, "_has_selected_root_unavailable_recovery_override", lambda: override)
+    semantic, raw = manager.load_root_state_with_raw()
+    semantic["nested"]["value"] = 2
+    assert raw["nested"]["value"] == 1
+
+
+@pytest.mark.unit
+async def test_absent_preimage_restore_retries_busy_unlink(tmp_path, monkeypatch):
+    path = tmp_path / "new-checkpoint.json"
+    path.write_bytes(b"new state")
+    original_unlink = Path.unlink
+    attempts = []
+    def busy_once(state_path, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            exc = PermissionError("sharing violation")
+            exc.winerror = 32
+            raise exc
+        return original_unlink(state_path, **kwargs)
+    monkeypatch.setattr(Path, "unlink", busy_once)
+    await asyncio.to_thread(storage_location_router_module._restore_state_file_from_preimage,
+                            path, {"existed": False, "bytes": None})
+    assert attempts == [1, 1]
+    assert not path.exists()
 
 
 @pytest.mark.unit

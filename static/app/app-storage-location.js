@@ -1377,6 +1377,9 @@
         if (payload && typeof payload === 'object') {
             var rawError = typeof payload.error === 'string' ? String(payload.error).trim() : '';
             var code = String(payload.error_code || payload.blocking_error_code || '').trim();
+            if (code === 'storage_policy_rollback_failed' && payload.phase === 'startup_release') {
+                return translate('storage.startupReleaseRollbackFailed', '解除受限启动失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
+            }
             if (code === 'storage_policy_rollback_failed' && payload.restart_mode) {
                 return translate('storage.restartRollbackFailed', '受控重启失败且未能确认原有状态已恢复，请检查或恢复状态文件。');
             }
@@ -2366,6 +2369,7 @@
     }
 
     window.appStorageLocation = {
+        formatError: extractResponseError,
         init: init,
         waitUntilMainUiAllowed: function () {
             return init();

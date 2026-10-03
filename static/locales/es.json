@@ -2323,6 +2323,7 @@
         "storageStateInvalid": "El archivo de estado de almacenamiento está dañado o tiene un formato no válido. No se escribió nada en el disco; comprueba o restaura el archivo de estado.",
         "restartRollbackFailed": "El reinicio controlado falló y no se pudo confirmar la restauración del estado anterior. Comprueba o restaura los archivos de estado.",
         "startupReleaseFailed": "Esta sesión no pudo salir del modo de inicio restringido. Vuelve a intentarlo o actualiza la página antes de continuar.",
+        "startupReleaseRollbackFailed": "No se pudo salir del modo de inicio restringido ni confirmar la restauración del estado anterior. Comprueba o restaura los archivos de estado.",
         "targetNotEmpty": "El destino ya contiene datos de ejecución. Confirma el destino antes de migrar.",
         "systemStatusUnavailable": "No se pudo confirmar el estado del servicio local. Inténtalo de nuevo.",
         "systemStatusUnexpected": "La API de estado de inicio del almacenamiento devolvió un resultado no reconocido.",
