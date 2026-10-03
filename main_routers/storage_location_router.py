@@ -1651,6 +1651,18 @@ async def _request_app_shutdown(request_app_shutdown) -> None:
             raise
 
 
+def _restart_write_error(
+    write_error: dict[str, Any], *, restart_mode: str, preflight: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {**write_error, "restart_mode": restart_mode, **preflight}
+    if write_error.get("error_code") == "storage_policy_rollback_failed":
+        payload.update(
+            error_code="restart_rollback_failed",
+            error="受控重启失败且未能确认原有状态已恢复，请检查或恢复状态文件。",
+        )
+    return payload
+
+
 async def _request_shutdown_or_rollback(
     config_manager, request_app_shutdown, *, snapshot: dict[str, Any],
     anchor_root: Path, restart_mode: str, preflight: dict[str, Any],
@@ -2337,7 +2349,9 @@ async def _post_storage_location_restart_locked(
         )
         if write_error is not None:
             response.status_code = 500
-            return {**write_error, "restart_mode": "rebind_only", **restart_preflight}
+            return _restart_write_error(
+                write_error, restart_mode="rebind_only", preflight=restart_preflight,
+            )
         shutdown_error = await _request_shutdown_or_rollback(
             config_manager, request_app_shutdown, snapshot=state_snapshot,
             anchor_root=anchor_root, restart_mode="rebind_only", preflight=restart_preflight,
@@ -2407,7 +2421,9 @@ async def _post_storage_location_restart_locked(
     )
     if write_error is not None:
         response.status_code = 500
-        return {**write_error, "restart_mode": "migrate_after_shutdown", **restart_preflight}
+        return _restart_write_error(
+            write_error, restart_mode="migrate_after_shutdown", preflight=restart_preflight,
+        )
     shutdown_error = await _request_shutdown_or_rollback(
         config_manager, request_app_shutdown, snapshot=rollback_state,
         anchor_root=anchor_root, restart_mode="migrate_after_shutdown", preflight=restart_preflight,
