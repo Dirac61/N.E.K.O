@@ -934,6 +934,34 @@ def test_sweeper_is_thread_safe_for_the_same_target(tmp_path):
 # ── read side ───────────────────────────────────────────────────────────
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory collision semantics")
+def test_windows_permission_collision_retries_but_directory_denial_does_not(tmp_path, monkeypatch):
+    real_open = file_utils.os.open
+    attempts = []
+
+    def collide_once(path, flags, mode):
+        attempts.append(path)
+        if len(attempts) == 1:
+            Path(path).mkdir()
+            raise PermissionError(13, "directory collision")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(file_utils.os, "open", collide_once)
+    fd, path = file_utils._create_exclusive_temp_file(tmp_path)
+    os.close(fd)
+    Path(path).unlink()
+    assert len(attempts) == 2
+
+    def deny_creation(*args):
+        attempts.append(1)
+        raise PermissionError(13, "directory denied")
+
+    monkeypatch.setattr(file_utils.os, "open", deny_creation)
+    with pytest.raises(PermissionError):
+        file_utils._create_exclusive_temp_file(tmp_path)
+    assert len(attempts) == 3
+
+
 def test_read_json_raises_on_missing_file(tmp_path):
     with pytest.raises(FileNotFoundError):
         read_json(tmp_path / "absent.json")

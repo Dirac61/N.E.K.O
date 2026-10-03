@@ -288,16 +288,14 @@ def _snapshot_storage_mutation_state(config_manager, *, anchor_root: Path) -> di
     policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
     migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
 
-    # root_state 先读，且保持原样：它走 ConfigManager 的严格加载器，读失败会抛，
-    # 快照整体失败、write() 一行不跑（与现状一致）。它不做字节化的原因见 PR 说明 ——
-    # 回滚要写回「原路径不可用」覆盖后的合成状态，与字节还原语义冲突，需单独定调。
-    root_state = config_manager.load_root_state()
+    # root_state 保留严格加载器的合成恢复状态；读失败统一归为状态不可读。
+    root_state = _read_root_state_snapshot(config_manager)
 
     # policy / migration 单独读字节做 pre-image，并保留原解析结果供既有调用方使用。
     policy_preimage = _read_state_file_preimage(policy_path)
     migration_preimage = _read_state_file_preimage(migration_path)
-    policy_payload = load_storage_policy(config_manager, anchor_root=anchor_root)
-    migration_payload = load_storage_migration(config_manager, anchor_root=anchor_root)
+    policy_payload = _parse_state_preimage(policy_preimage)
+    migration_payload = _parse_state_preimage(migration_preimage)
 
     # 存在却解析不出对象（非法 JSON、合法 JSON 但非对象）：按原始字节纳入快照，不做修复。
     # 写入成功时新内容会自然覆盖它；写入失败时回滚只照抄字节，损坏内容原样留下。
@@ -319,6 +317,27 @@ def _snapshot_storage_mutation_state(config_manager, *, anchor_root: Path) -> di
         "policy_preimage": policy_preimage,
         "migration_preimage": migration_preimage,
     }
+
+
+def _read_root_state_snapshot(config_manager) -> dict[str, Any]:
+    try:
+        return config_manager.load_root_state()
+    except Exception as exc:
+        raise _StorageStateUnreadable(
+            Path(getattr(config_manager, "root_state_path", "root_state.json")), exc
+        ) from exc
+
+
+def _parse_state_preimage(preimage: dict[str, Any]) -> dict[str, Any] | None:
+    import json
+
+    if not preimage.get("existed"):
+        return None
+    try:
+        payload = json.loads(preimage["bytes"].decode("utf-8"))
+    except (ValueError, UnicodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _restore_state_file_from_preimage(path: Path, preimage: dict[str, Any]) -> None:
@@ -382,14 +401,7 @@ def _restore_storage_mutation_state(
     ``_run_locked_storage_job``, which waits for the worker to finish before it
     propagates cancellation.
     """
-    # ⚠️ 空快照绝不能往下走。下面的分支把"没有 migration / policy 键"读作"这两个文件
-    # 本来就不存在"，于是删检查点、unlink 策略文件。而快照一旦真的取到，
-    # _snapshot_storage_mutation_state 必定三组键齐全（值可以是 None）——所以
-    # 「空 dict」只可能意味着快照压根没取成（例如 load_root_state 撞上 I/O 错误），
-    # 这时候没有任何写发生过，回滚只会毁掉本来好好的文件。
-    #
-    # 另外：带 policy_preimage / migration_preimage 时一律按原始字节还原，「本来不存在」
-    # 由 pre-image 里的 existed=False 表达；三个解析键只服务没有 pre-image 的旧快照。
+    # 空快照表示未开始写入；非空快照必须携带字节 pre-image，缺字段不能当作文件不存在。
     if not snapshot:
         logger.warning("skipping storage mutation rollback: snapshot was never taken")
         return
@@ -401,14 +413,10 @@ def _restore_storage_mutation_state(
     # 「读不出来」的文件到不了这里——快照阶段已终止。
     migration_path = get_storage_migration_path(config_manager, anchor_root=anchor_root)
     migration_preimage = snapshot.get("migration_preimage")
-    previous_migration = snapshot.get("migration")
     try:
-        if isinstance(migration_preimage, dict):
-            _restore_state_file_from_preimage(migration_path, migration_preimage)
-        elif isinstance(previous_migration, dict):
-            save_storage_migration(config_manager, previous_migration, anchor_root=anchor_root)
-        else:
-            delete_storage_migration(config_manager, anchor_root=anchor_root)
+        if not isinstance(migration_preimage, dict):
+            raise RuntimeError("missing migration pre-image")
+        _restore_state_file_from_preimage(migration_path, migration_preimage)
     except Exception as exc:
         # 单步失败不中断：policy 和 root_state 仍然要尽力还原
         logger.exception(
@@ -420,20 +428,10 @@ def _restore_storage_mutation_state(
     # ---- 第二步：策略文件 ----
     policy_path = get_storage_policy_path(config_manager, anchor_root=anchor_root)
     policy_preimage = snapshot.get("policy_preimage")
-    previous_policy = snapshot.get("policy")
     try:
-        if isinstance(policy_preimage, dict):
-            # 字节还原：不重新序列化，pre-image 的格式与内容逐字节保持原样（含损坏内容）
-            _restore_state_file_from_preimage(policy_path, policy_preimage)
-        elif isinstance(previous_policy, dict):
-            from utils.file_utils import atomic_write_json
-
-            atomic_write_json(policy_path, previous_policy, ensure_ascii=False, indent=2)
-        else:
-            try:
-                os.unlink(policy_path)
-            except FileNotFoundError:
-                pass
+        if not isinstance(policy_preimage, dict):
+            raise RuntimeError("missing policy pre-image")
+        _restore_state_file_from_preimage(policy_path, policy_preimage)
     except Exception as exc:
         logger.exception(
             "[storage_location] 回滚策略文件失败，继续尝试还原 root_state: %s",
@@ -455,7 +453,11 @@ def _restore_storage_mutation_state(
         try:
             with root_state_transaction():
                 try:
-                    current_root_state = config_manager.load_root_state()
+                    has_override = getattr(
+                        config_manager, "_has_selected_root_unavailable_recovery_override", lambda: False
+                    )
+                    # 覆盖生效时加载器返回合成值，不能据此判定磁盘已恢复。
+                    current_root_state = None if has_override() else config_manager.load_root_state()
                 except Exception:
                     # 读不出来就无法确认是否已恢复 → 不跳过，照常写回（写不动时仍会抛）
                     current_root_state = None
@@ -483,12 +485,13 @@ def _restore_restart_schedule_state(
 ) -> None:
     """Restore the restart checkpoint and root state as one worker job."""
     previous_root_state = snapshot.get("root_state")
-    previous_migration = snapshot.get("migration")
     try:
-        if isinstance(previous_migration, dict):
-            save_storage_migration(config_manager, previous_migration, anchor_root=anchor_root)
-        else:
-            delete_storage_migration(config_manager, anchor_root=anchor_root)
+        if not snapshot:
+            return
+        _restore_state_file_from_preimage(
+            get_storage_migration_path(config_manager, anchor_root=anchor_root),
+            snapshot["migration_preimage"],
+        )
     except Exception:
         # 先前确有 checkpoint 时，save 失败后绝不能退化成 delete；原文件
         # 很可能仍由 atomic write 保留，删除反而把一次回滚失败扩大成数据丢失。
@@ -638,18 +641,9 @@ async def _apply_storage_mutation_writes_or_rollback(
             write=write,
         )
     except asyncio.CancelledError:
-        # 取消必须无条件回滚，绝不能按 _write_outcome 跳过。
-        # 理由：取消能走到这里，就说明「解除启动屏障」这一步一定没执行——要么还没轮到它
-        # （这里正是写入函数的返回点），要么正在执行中被
-        # _release_storage_startup_barrier_or_rollback 接走。也就是说这次操作从会话角度看
-        # 从未生效，盘上就不能留着「已生效」的样子：策略文件写着选好了、屏障却还锁着，
-        # 前端浮层不再弹出，用户刷新也救不回来，只能重启应用。
-        # 特别注意 "success" 恰恰是最需要回滚的那一种，不是可以跳过的那一种。
-        # worker 内部已经回滚过（"rolled_back"）时再走一遍是空转：盘上已等于 pre-image 时
-        # _restore_state_file_from_preimage 会跳过写入；快照为空则说明 write() 一行都没跑，
-        # 没有东西需要回滚。
-        # CancelledError 是 BaseException，下面的 except Exception 接不住，所以必须单列。
-        if snapshot_out:
+        # worker 已结束。成功写入但屏障尚未解除时必须回滚；写入失败已在原事务内
+        # 尝试回滚，不能再提交第二个任务覆盖其他写者的新状态。
+        if snapshot_out.get("_write_outcome") == "success":
             with suppress(Exception, asyncio.CancelledError):
                 await _run_locked_storage_job(
                     partial(
@@ -707,7 +701,7 @@ async def _apply_storage_mutation_writes_or_rollback(
         #   - "rolled_back"   → 三步全部成功
         #   - "rollback_failed" → best-effort 下至少一步失败，异常在 _rollback_error
         outcome = snapshot_out.get("_write_outcome")
-        if outcome == "rollback_failed":
+        if outcome != "rolled_back":
             # 回滚要往同一个「不可写」的目录里重新落盘，所以它自己也会失败：恢复失败的
             # 迁移分支就是现成的例子——检查点已被 delete_storage_migration 删掉，回滚
             # 要重新写回它，同样会被拒。此时盘上并没有回到 pre-image，绝不能对用户声称
@@ -724,7 +718,7 @@ async def _apply_storage_mutation_writes_or_rollback(
                 "error_code": "storage_policy_rollback_failed",
                 "error": "写入存储位置配置失败，且未能恢复原有状态，请检查本机状态目录是否可写；若仍异常请手动确认状态文件。",
             }
-        # outcome == "rolled_back"（或未设置，走保守分支）
+        # 只有确认回滚完成才可以声称已恢复。
         logger.warning(
             "[storage_location] 存储位置配置写入失败，已回滚原有状态: %s",
             exc,
@@ -2365,13 +2359,17 @@ async def _post_storage_location_restart_locked(
             )
 
         state_snapshot = {}
+        # 写入阶段的异常/取消由共享入口完整处理；关闭阶段独立处理，避免再次回滚。
+        _, write_error = await _apply_storage_mutation_writes_or_rollback(
+            config_manager,
+            anchor_root=anchor_root,
+            snapshot_out=state_snapshot,
+            write=_rebind_to_selected_root,
+        )
+        if write_error is not None:
+            response.status_code = 500
+            return {**write_error, "restart_mode": "rebind_only", **restart_preflight}
         try:
-            await _apply_storage_mutation_writes(
-                config_manager,
-                anchor_root=anchor_root,
-                snapshot_out=state_snapshot,
-                write=_rebind_to_selected_root,
-            )
             await _request_app_shutdown(request_app_shutdown)
         except _ShutdownAcceptedCancellation:
             # Shutdown 已经被 launcher 接受；保留本次写入，让退出后的接力流程执行。
@@ -2383,7 +2381,7 @@ async def _post_storage_location_restart_locked(
             # "正在迁移"。
             # CancelledError 是 BaseException，下面的 except Exception 接不住，所以
             # 必须单列。回滚 worker 即使再收到取消也会先跑到终态。
-            if state_snapshot:
+            if state_snapshot.get("_write_outcome") == "success":
                 with suppress(Exception, asyncio.CancelledError):
                     await _run_locked_storage_job(
                         partial(
@@ -2394,7 +2392,8 @@ async def _post_storage_location_restart_locked(
                         )
                     )
             raise
-        except Exception as exc:
+        except Exception:
+            logger.exception("failed to schedule storage rebind shutdown")
             try:
                 await _run_locked_storage_job(
                     partial(
@@ -2413,7 +2412,7 @@ async def _post_storage_location_restart_locked(
             return {
                 "ok": False,
                 "error_code": "restart_schedule_failed",
-                "error": f"受控关闭启动失败: {exc}",
+                "error": "受控关闭启动失败，请稍后重试。",
                 "restart_mode": "rebind_only",
                 **restart_preflight,
             }
@@ -2461,10 +2460,12 @@ async def _post_storage_location_restart_locked(
             # 两份 pre-image 都读到之后再一起记进 rollback_state，这样
             # "rollback_state 非空" 就等价于 "两份都在手上"。分两次记的话，第二次读
             # 抛异常会留下 migration 键缺失，回滚分支就会把一份本来就存在的检查点删掉。
-            previous_root_state = config_manager.load_root_state()
-            previous_migration = load_storage_migration(config_manager, anchor_root=anchor_root)
+            previous_root_state = _read_root_state_snapshot(config_manager)
+            previous_migration = _read_state_file_preimage(
+                get_storage_migration_path(config_manager, anchor_root=anchor_root)
+            )
             rollback_state["root_state"] = previous_root_state
-            rollback_state["migration"] = previous_migration
+            rollback_state["migration_preimage"] = previous_migration
             pending_payload = create_pending_storage_migration(
                 config_manager,
                 source_root=current_root,
@@ -2503,6 +2504,7 @@ async def _post_storage_location_restart_locked(
                 )
         raise
     except Exception as exc:
+        logger.exception("failed to schedule storage migration shutdown")
         # rollback_state 为空 = 两份 pre-image 还没读到，也就意味着
         # create_pending_storage_migration 一行都还没跑，没有东西需要回滚。这时候
         # 走下面的分支反而会把一份本来就在盘上的检查点删掉。
@@ -2518,8 +2520,8 @@ async def _post_storage_location_restart_locked(
         response.status_code = 500
         return {
             "ok": False,
-            "error_code": "restart_schedule_failed",
-            "error": f"受控关闭启动失败: {exc}",
+            "error_code": "storage_state_unreadable" if isinstance(exc, _StorageStateUnreadable) else "restart_schedule_failed",
+            "error": "受控关闭启动失败，状态文件可能无法读取，请检查本机状态目录是否可访问后重试。",
             **restart_preflight,
         }
 
