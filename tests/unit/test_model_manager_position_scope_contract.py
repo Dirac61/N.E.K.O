@@ -121,3 +121,38 @@ def test_safety_zone_script_is_loaded_on_the_manager_page():
     script = "/static/js/model_manager/safety-zone-guard.js"
     assert script in template, "模型管理页没有加载安全区模块"
     assert template.index(script) > template.index("/static/js/model_manager/background-model-drag.js")
+
+
+def test_pngtuber_position_fields_are_stripped_from_runtime_config_at_save_time():
+    """保存角色时 pngtuberManager.config 是最后合并的一方，偏移字段必须再摘一次。"""
+    pngtuber_source = _read(PNGTUBER_CORE_JS)
+    layout_fields = sorted(set(re.findall(r"offset[XY]:\s*'([^']+)'", pngtuber_source)))
+    source = _read(PAGE_CONTROLLER_JS)
+    window_ = source[source.index("const runtimePNGTuberSource"):source.index("const runtimePNGTuberSource") + 900]
+    assert "Object.assign({}, runtimePNGTuberSource)" in window_, (
+        "必须复制运行时配置再摘字段，不能直接改 pngtuberManager.config"
+    )
+    for field in layout_fields:
+        assert f"'{field}'" in window_, f"保存时没有摘掉运行时配置里的位置字段 {field}"
+
+
+def test_load_snapshot_is_captured_before_centering_and_survives_repeated_ready_events():
+    """Live2D 一次加载会连发两个就绪事件：快照必须在搬动前记录，且同模型不覆盖。"""
+    source = _read(GUARD_JS)
+    try_center = _function_body(source, "function tryCenter(")
+    assert "captureLoadSnapshot();" in try_center, "居中前没有记录加载时快照"
+    assert try_center.index("captureLoadSnapshot();") < try_center.index("applyCentering();"), (
+        "快照必须在 applyCentering 之前记录，否则记到的是居中位置"
+    )
+    capture = source[source.index("function captureLoadSnapshot("):source.index("function resolvePositionSubstitute(")]
+    assert "loadSnapshotByType.set(type, record)" in capture
+    assert "String(existing.path || '') === String(record.path || '')" in capture, (
+        "同一路径重复就绪时必须保留首次快照，防止快照被居中位置覆盖"
+    )
+
+
+def test_lookup_stored_entry_does_not_guess_by_filename():
+    """底账查询只认归一化后的完整路径，不再退化成「文件名相同就算同一个模型」。"""
+    fallback = _function_body(_read(GUARD_JS), "function lookupStoredEntry(")
+    assert "preferenceFilename" not in fallback, "底账查询不应该再用文件名兜底"
+    assert "storedPreferencesList" not in fallback, "底账查询不应该再依赖全量列表"

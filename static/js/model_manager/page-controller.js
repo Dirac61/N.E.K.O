@@ -1784,9 +1784,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                     }
                 }
                 const currentPNGTuberConfig = currentModelInfo && currentModelInfo.pngtuber ? currentModelInfo.pngtuber : null;
-                const runtimePNGTuberConfig = window.pngtuberManager && window.pngtuberManager.config
+                // 管理页不写位置：暂存时摘过一次偏移，但这里的运行时配置（pngtuberManager.config）
+                // 是最后合并的一方，可能已被本页摆位改过，偏移字段必须再摘一次才能落库。
+                // 复制一份再摘，不动运行时的活配置；缩放等其它字段照常保存。
+                const runtimePNGTuberSource = window.pngtuberManager && window.pngtuberManager.config
                     ? window.pngtuberManager.config
                     : null;
+                let runtimePNGTuberConfig = null;
+                if (runtimePNGTuberSource) {
+                    runtimePNGTuberConfig = Object.assign({}, runtimePNGTuberSource);
+                    ['offset_x', 'offset_y', 'mobile_offset_x', 'mobile_offset_y'].forEach((key) => {
+                        delete runtimePNGTuberConfig[key];
+                    });
+                }
                 const pngtuberConfig = mergePNGTuberConfigForSave(
                     selectedPNGTuberConfig,
                     currentPNGTuberConfig,
@@ -7375,9 +7385,10 @@ document.addEventListener('DOMContentLoaded', async () => {
                     showModelManagerToast(partialMessage, 3600, 'warning');
                     window._modelManagerHasSaved = true;
                 } else if (modelSavedAtLeastPartially) {
-                    const message = t('live2d.modelSavedPositionFailed', '模型设置保存成功!');
-                    showStatus(message, 2000);
-                    showModelManagerToast(message, 3200, 'success');
+                    // 模型设置存好了，但偏好请求（携带缩放/参数）失败：如实提示部分失败，
+                    // 不能报成功——用户会以为缩放/参数也存上了。
+                    showStatus(partialMessage, 3000);
+                    showModelManagerToast(partialMessage, 3600, 'warning');
                     if (modelStatus === 'ok') {
                         if (saveContextStillCurrent) {
                             window._savedModelSnapshot = captureSettingsSnapshot();

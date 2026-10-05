@@ -67,7 +67,6 @@
     let stopped = false;
     let storedPositionsPromise = null;
     let storedPositionByPath = null;
-    let storedPreferencesList = null;
     let loadSnapshotByType = new Map();
 
     function isMmPage() {
@@ -365,6 +364,10 @@
         if (!canTakeOverModel() || !isModelReadyForActiveType()) return false;
         const current = getModelScreenCenter();
         if (!current) return false;
+        // 必须在任何搬动之前记录「加载时位置」——它是本页唯一允许被写回去的位置，
+        // 也是主页面会用的值。放在这里而不是就绪事件入口：一是保证记录时模型一定就绪，
+        // 二是 Live2D 一次加载连发两个就绪事件，第二次进来模型已被居中，照搬会污染快照。
+        captureLoadSnapshot();
         // 只记第一次：这是「进入页面之前」的位置，供离开时恢复。
         if (!savedCenter) savedCenter = { cx: current.x, cy: current.y };
         applyCentering();
@@ -390,8 +393,6 @@
     // 每次「模型加载完成」或「切换模型类型」都重新摆位一次。
     function armCentering() {
         if (!isMmPage() || stopped) return;
-        // 必须在任何搬动之前记录「加载时位置」，它是本页唯一允许被写回去的位置。
-        captureLoadSnapshot();
         readinessDeadline = Date.now() + READINESS_TIMEOUT_MS;
         if (tryCenter()) {
             stopPolling();
@@ -557,18 +558,14 @@
         return raw.split('#')[0].split('?')[0].trim().replace(/\\/g, '/');
     }
 
-    function preferenceFilename(path) {
-        const parts = String(path).split('/').filter(Boolean);
-        return parts.length ? parts[parts.length - 1].toLowerCase() : '';
-    }
-
+    // 只在两条路径都能确定、且归一化后完全一致时才算「同一个模型」。
+    // 不做文件名兜底：同名文件可能分属不同模型，一旦猜错就会把别的模型的位置
+    // 写到当前模型头上。匹配不上时宁可放弃替换，交给「加载时快照」兜底。
     function preferencePathMatches(candidate, target) {
         const left = normalizePreferencePath(candidate);
         const right = normalizePreferencePath(target);
         if (!left || !right) return true;   // 路径未知时不否决
-        if (left === right) return true;
-        const leftName = preferenceFilename(left);
-        return !!leftName && leftName === preferenceFilename(right);
+        return left === right;
     }
 
     async function fetchStoredPositions() {
@@ -580,13 +577,13 @@
                 ? data
                 : (data && Array.isArray(data.preferences) ? data.preferences : null);
             if (!list) return null;
-            const entries = list.filter((entry) => entry && typeof entry === 'object');
             const map = new Map();
-            entries.forEach((entry) => {
+            list.forEach((entry) => {
+                if (!entry || typeof entry !== 'object') return;
                 const key = normalizePreferencePath(entry.model_path || entry.modelPath);
                 if (key) map.set(key, entry);
             });
-            return { map, entries };
+            return map;
         } catch (_) {
             return null;
         }
@@ -594,12 +591,9 @@
 
     function ensureStoredPositions() {
         if (!storedPositionsPromise) {
-            storedPositionsPromise = fetchStoredPositions().then((result) => {
-                if (result) {
-                    storedPositionByPath = result.map;
-                    storedPreferencesList = result.entries;
-                }
-                return result;
+            storedPositionsPromise = fetchStoredPositions().then((map) => {
+                if (map) storedPositionByPath = map;
+                return map;
             });
         }
         return storedPositionsPromise;
@@ -607,18 +601,8 @@
 
     function lookupStoredEntry(modelPath) {
         const key = normalizePreferencePath(modelPath);
-        if (!key) return null;
-        if (storedPositionByPath) {
-            const normalizedExact = storedPositionByPath.get(key);
-            if (normalizedExact) return normalizedExact;
-        }
-        if (!Array.isArray(storedPreferencesList)) return null;
-        // 再兜一层：文件名相同就认为是同一个模型（与运行时的匹配策略一致）
-        const name = preferenceFilename(key);
-        if (!name) return null;
-        return storedPreferencesList.find((entry) => (
-            preferenceFilename(normalizePreferencePath(entry.model_path || entry.modelPath)) === name
-        )) || null;
+        if (!key || !storedPositionByPath) return null;
+        return storedPositionByPath.get(key) || null;
     }
 
     // 模型加载完成、且本模块还没搬动它之前的位置。它要么等于后端存的位置（有偏好记录），
@@ -648,7 +632,13 @@
             }
         }
 
-        if (record) loadSnapshotByType.set(type, record);
+        if (!record) return;
+        const existing = loadSnapshotByType.get(type);
+        // 同一个模型重复就绪（Live2D 一次加载会连发两个就绪事件）时保留首次快照：
+        // 第二次进来模型多半已被居中，覆盖会把「主页面会用的位置」换成临时居中位，
+        // 首次保存（后端无记录）时就会把这个临时位置写进全局偏好。
+        if (existing && String(existing.path || '') === String(record.path || '')) return;
+        loadSnapshotByType.set(type, record);
     }
 
     // 返回 null 表示「这次不替换」。
