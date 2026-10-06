@@ -57,6 +57,10 @@
     const DEBUG_FLAG_KEY = 'nekoSafetyZoneDebug';
 
     let savedCenter = null;
+    // 这份「进入前的中心」属于哪个模型（取值见 currentModelIdentity）。必须成对使用：
+    // 切换模型后身份会变，据此判断记录是否还有效，否则离开时会把当前模型搬到上一个
+    // 模型的中心去（审查指出：切换模型后最后一个模型会被移回之前模型的位置）。
+    let savedCenterPath = null;
     let readyListenersBound = false;
     let pollTimerId = null;
     let readinessDeadline = 0;
@@ -97,6 +101,30 @@
 
     function live3dManager() {
         return getLive3DSubType() === 'mmd' ? window.mmdManager : window.vrmManager;
+    }
+
+    // 取当前活动模型的身份标识。作用：把「进入前的中心」和具体模型绑定 —— 切换模型后
+    // 身份会变，记录随之失效（见 tryCenter / restoreOnLeave）。
+    // 取值规则刻意与「加载时快照」保持一致，避免同一个模块里出现两套识别标准。
+    // 取不到时返回空串：此时无法区分模型，退化为旧行为，但绝不会因此误伤（不会跨模型搬移）。
+    function currentModelIdentity() {
+        const type = getActiveModelType();
+
+        if (type === 'live2d') {
+            // Live2D：用运行时记录的加载路径，与快照登记的是同一个值。
+            const manager = window.live2dManager;
+            return String((manager && manager._lastLoadedModelPath) || '');
+        }
+
+        if (type === 'pngtuber') {
+            // PNGTuber 没有稳定的路径标识，同一页通常只加载一个，用固定串做身份即可。
+            return 'pngtuber';
+        }
+
+        // 3D（VRM / MMD）：用模型对象的 url，与快照登记的路径一致。
+        const manager = live3dManager();
+        const model = manager && manager.currentModel;
+        return String((model && model.url) || '');
     }
 
     function sidebarRect() {
@@ -365,8 +393,22 @@
         // 也是主页面会用的值。放在这里而不是就绪事件入口：一是保证记录时模型一定就绪，
         // 二是 Live2D 一次加载连发两个就绪事件，第二次进来模型已被居中，照搬会污染快照。
         captureLoadSnapshot();
-        // 只记第一次：这是「进入页面之前」的位置，供离开时恢复。
-        if (!savedCenter) savedCenter = { cx: current.x, cy: current.y };
+        // 「进入前的中心」按模型身份保存：
+        //   - 同一模型只记第一次，因此后面的居中复核（就绪事件连发、多次重试）不会把
+        //     「已居中的位置」误当成原始位置覆盖进来；
+        //   - 切换到新模型时身份变化，用新模型搬动前的中心替换掉上一个模型的记录，
+        //     避免离开时拿旧模型的中心去恢复当前模型。
+        const identity = currentModelIdentity();
+        if (!savedCenter || savedCenterPath !== identity) {
+            if (savedCenter && isDebugEnabled()) {
+                console.log('[安全区] 进入前的中心随模型切换而替换', {
+                    旧身份: savedCenterPath,
+                    新身份: identity
+                });
+            }
+            savedCenter = { cx: current.x, cy: current.y };
+            savedCenterPath = identity;
+        }
         // 关键点：必须如实反映「这次到底有没有把模型搬成功」。
         // applyCentering 内部经 moveModelScreenBy 搬模型，VRM 在运行时自己正在
         // 自动移动或平滑转向（isVrmGuidedMovementActive 为真）时会直接返回 false，
@@ -451,12 +493,25 @@
         if (stopped || !isMmPage()) return;
         const saved = savedCenter;
         if (!saved) return;
+        // 身份校验：只在记录属于当前模型时才恢复。切换过模型后，记录里可能还是上一个
+        // 模型的中心，此时直接返回、不做任何位移，绝不能把当前模型搬到别的模型的位置上。
+        const identity = currentModelIdentity();
+        if (savedCenterPath !== identity) {
+            if (isDebugEnabled()) {
+                console.log('[安全区] 跳过恢复：记录不属于当前模型', {
+                    记录身份: savedCenterPath,
+                    当前身份: identity
+                });
+            }
+            return;
+        }
         const current = getModelScreenCenter();
         // 取不到当前中心时保留 savedCenter，留给下一次机会，避免状态被提前清空。
         if (!current) return;
         // 位移成功后才清 savedCenter：若位移失败（运行时正忙等），保留快照以便后续重试。
         if (moveModelScreenBy(saved.cx - current.x, saved.cy - current.y)) {
             savedCenter = null;
+            savedCenterPath = null;
         }
     }
 

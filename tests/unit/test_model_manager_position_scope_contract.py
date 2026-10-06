@@ -47,7 +47,10 @@ def _read(path: Path) -> str:
 def _function_body(source: str, header: str) -> str:
     """Slice an approximate range from ``header`` up to the next same-level ``}``, long enough for string assertions."""
     start = source.index(header)
-    return source[start:start + 1200]
+    # 窗口只向后延长，因此“先 A 后 B”的顺序断言不受影响；放宽到 2000 是为了容纳
+    # tryCenter 里为「按模型身份记录进入前的中心」新增的注释与代码，否则 applyCentering
+    # 会被挤出窗口。
+    return source[start:start + 2000]
 
 
 def _parse_signature_params(source: str, expected_params: str):
@@ -247,3 +250,29 @@ def test_leave_restore_clears_saved_center_only_after_move():
     source = _read(GUARD_JS)
     restore = _function_body(source, "function restoreOnLeave(")
     assert restore.index("moveModelScreenBy(") < restore.index("savedCenter = null")
+
+
+def test_leave_restore_is_scoped_to_the_active_model_identity():
+    """The pre-centering center must be keyed by model identity, not shared page-wide.
+
+    A single page-wide record is reused after a model switch, so restoreOnLeave
+    moves the new model to the previous model's center. Recording and restoring
+    must be scoped to the active model identity, and restore must refuse to move
+    when the stored center belongs to a different model.
+    """
+    source = _read(GUARD_JS)
+
+    identity = _function_body(source, "function currentModelIdentity(")
+    # Same identity source as the load snapshot, so both mechanisms agree.
+    assert "_lastLoadedModelPath" in identity
+    assert "model.url" in identity
+
+    try_center = _function_body(source, "function tryCenter(")
+    assert "savedCenterPath !== identity" in try_center
+    assert "savedCenterPath = identity" in try_center
+
+    restore = _function_body(source, "function restoreOnLeave(")
+    assert "currentModelIdentity()" in restore
+    assert "savedCenterPath !== identity" in restore
+    assert restore.index("savedCenterPath !== identity") < restore.index("moveModelScreenBy(")
+    assert "savedCenterPath = null" in restore
