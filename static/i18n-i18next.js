@@ -29,9 +29,11 @@
     const SUPPORTED_LANGUAGES = ['zh-CN', 'zh-TW', 'en', 'ja', 'ko', 'ru', 'es', 'pt'];
 
     // locale 资源版本（用于 cache-busting，避免客户端长期缓存旧语言包导致新增 key 不生效）
-    // 明文 HTTP 配对提示与上游剧场重邀文案合并，叠加模型管理页保存提示（不再出现"位置"），
-    // 刷新网页和 Electron 的八语言包缓存。
-    const LOCALE_VERSION = '2026-10-05-model-manager-save-prompt-main-merge';
+    // 明文 HTTP 配对提示与上游剧场重邀文案合并，叠加模型管理页保存提示（不再出现"位置"）。
+    // 本次在上一版基础上又改动了语言包的键结构：删掉两个死键、把 positionSavedModelFailed
+    // 改名为 settingsSaveFailed，所以必须再次递增版本号，刷新网页和 Electron 的八语言包缓存。
+    // 另：上一版版本号只存在于本 PR 尚未合并的分支上，从未发布，故无需登记进废弃清单。
+    const LOCALE_VERSION = '2026-10-06-model-manager-locale-key-rename';
     function initDecorativeImageDragGuard() {
         const markImage = (img) => {
             if (!(img instanceof HTMLImageElement)) return;

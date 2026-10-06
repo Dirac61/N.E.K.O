@@ -7389,7 +7389,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     showModelManagerToast(partialMessage, 3200, 'warning');
                     window._modelManagerHasSaved = true;
                 } else if (positionSuccess) {
-                    const message = t('live2d.positionSavedModelFailed', '模型设置保存失败!');
+                    // 键名已随「管理页不写位置」改名：positionSavedModelFailed -> settingsSaveFailed，
+                    // 语义是「模型设置保存失败」，不再带位置含义。
+                    const message = t('live2d.settingsSaveFailed', '模型设置保存失败!');
                     showStatus(message, 2000);
                     showModelManagerToast(message, 3200, 'warning');
                     window._modelManagerHasSaved = true;
