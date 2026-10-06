@@ -117,8 +117,14 @@
         }
 
         if (type === 'pngtuber') {
-            // PNGTuber 没有稳定的路径标识，同一页通常只加载一个，用固定串做身份即可。
-            return 'pngtuber';
+            // PNGTuber 没有路径字段，用当前配置的 idle_image 作为身份：切换到另一份配置时
+            // 这个值会变，从而正确替换旧记录（此前返回固定串 'pngtuber'，两份配置身份相同，
+            // 切换时不替换、离开时仍被搬回上一份配置的中心）。取不到时退回固定串兜底，
+            // 退化为旧行为但不会误伤。
+            const manager = window.pngtuberManager;
+            const config = manager && manager.config;
+            const idleImage = config && config.idle_image;
+            return idleImage ? String(idleImage) : 'pngtuber';
         }
 
         // 3D（VRM / MMD）：用模型对象的 url，与快照登记的路径一致。

@@ -266,6 +266,9 @@ def test_leave_restore_is_scoped_to_the_active_model_identity():
     # Same identity source as the load snapshot, so both mechanisms agree.
     assert "_lastLoadedModelPath" in identity
     assert "model.url" in identity
+    # PNGTuber must key on the active config (idle_image), not a constant, otherwise two
+    # different PNGTuber configs share one identity and the record is never replaced.
+    assert "config.idle_image" in identity
 
     try_center = _function_body(source, "function tryCenter(")
     assert "savedCenterPath !== identity" in try_center
