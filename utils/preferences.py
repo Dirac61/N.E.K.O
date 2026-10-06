@@ -142,15 +142,21 @@ def save_user_preferences(preferences: List[Dict[str, Any]]) -> bool:
         print(f"保存用户偏好失败: {e}")
         return False
 
-def update_model_preferences(model_path: str, position: Dict[str, float], scale: Dict[str, float], parameters: Optional[Dict[str, float]] = None, display: Optional[Dict[str, float]] = None, rotation: Optional[Dict[str, float]] = None, viewport: Optional[Dict[str, float]] = None, camera_position: Optional[Dict[str, float]] = None) -> bool:
-    """Update one model without racing another preference-file writer."""
+def update_model_preferences(model_path: str, position: Dict[str, float], scale: Dict[str, float], parameters: Optional[Dict[str, float]] = None, display: Optional[Dict[str, float]] = None, rotation: Optional[Dict[str, float]] = None, viewport: Optional[Dict[str, float]] = None, camera_position: Optional[Dict[str, float]] = None, preserve_position: bool = False) -> bool:
+    """Update one model without racing another preference-file writer.
+
+    When preserve_position is true (the model-manager position-isolation flag) and
+    the model already has a record, keep its stored position/display/viewport
+    instead of overwriting them with the temporary placement from the request;
+    all other fields are still updated as usual.
+    """
     try:
         assert_cloudsave_writable(_config_manager, operation="save", target="user_preferences.json")
         _config_manager.ensure_config_directory()
         with _locked_preferences_store():
             return _update_model_preferences_unlocked(
                 model_path, position, scale, parameters, display, rotation,
-                viewport, camera_position,
+                viewport, camera_position, preserve_position,
             )
     except MaintenanceModeError:
         raise
@@ -159,7 +165,7 @@ def update_model_preferences(model_path: str, position: Dict[str, float], scale:
         return False
 
 
-def _update_model_preferences_unlocked(model_path: str, position: Dict[str, float], scale: Dict[str, float], parameters: Optional[Dict[str, float]] = None, display: Optional[Dict[str, float]] = None, rotation: Optional[Dict[str, float]] = None, viewport: Optional[Dict[str, float]] = None, camera_position: Optional[Dict[str, float]] = None) -> bool:
+def _update_model_preferences_unlocked(model_path: str, position: Dict[str, float], scale: Dict[str, float], parameters: Optional[Dict[str, float]] = None, display: Optional[Dict[str, float]] = None, rotation: Optional[Dict[str, float]] = None, viewport: Optional[Dict[str, float]] = None, camera_position: Optional[Dict[str, float]] = None, preserve_position: bool = False) -> bool:
     """
     Update preferences of the given model
 
@@ -171,7 +177,11 @@ def _update_model_preferences_unlocked(model_path: str, position: Dict[str, floa
         display (Optional[Dict[str, float]]): display info {'screenX': float, 'screenY': float}, for multi-monitor position restore
         rotation (Optional[Dict[str, float]]): rotation info {'x': float, 'y': float, 'z': float}, for VRM model orientation
         viewport (Optional[Dict[str, float]]): viewport info {'width': float, 'height': float}, for cross-resolution position and scale normalization
-        
+        preserve_position (bool): model-manager position-isolation flag; when true and
+            the model already has a record, keep the stored position/display/viewport
+            and ignore the incoming position (the manager page's temporary placement
+            must not be persisted)
+
     Returns:
         bool: True on success, False on failure
     """
@@ -250,6 +260,15 @@ def _update_model_preferences_unlocked(model_path: str, position: Dict[str, floa
             elif 'camera_position' in existing_pref:
                 # 保留已有相机位置信息
                 new_model_pref['camera_position'] = existing_pref['camera_position']
+            # 管理页位置隔离：preserve_position 为真时，位置及其解释元数据（display/viewport）
+            # 一律沿用后端已存的值，不用管理页的临时摆位覆盖。已有记录缺少某个键时删掉它，
+            # 避免出现「新传入的位置基准 + 旧的已存位置」这种错位组合。
+            if preserve_position:
+                for key in ('position', 'display', 'viewport'):
+                    if key in existing_pref:
+                        new_model_pref[key] = existing_pref[key]
+                    else:
+                        new_model_pref.pop(key, None)
             current_preferences[model_index] = new_model_pref
         else:
             # 添加新模型的偏好到列表开头（作为首选）

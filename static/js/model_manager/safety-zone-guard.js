@@ -16,11 +16,12 @@
  *      「直接抓住模型拖动」（各运行时自己的拖拽代码）。两者都要覆盖，因此这里
  *      统一在全局 pointerup/pointercancel 后做多次幂等的 clamp，跨过各运行时
  *      260~300ms 的回弹/保存动画再复核。
- *   4. 本页不写位置：管理页上任何位置持久化都会被「替换成后端已经存着的那个位置」，
+ *   4. 本页不写位置：改写函数返回 preservePosition=true，运行时把它透传成请求体里的
+ *      preserve_position，后端见到该标记且已有该模型记录时保留后端已存的位置，
  *      所以管理页的临时摆位绝不会影响主页面；缩放/旋转/参数/相机等仍照原样保存。
  *      （管理页的位置与主页面位置互不影响。）
  *      改写的入口是运行时里的判断：saveUserPreferences 开头看本模块在不在，在就调用
- *      rewritePositionWrite() 拿改写后的 position/display/viewport。本模块只在管理页
+ *      rewritePositionWrite() 拿改写后的 position/preservePosition。本模块只在管理页
  *      加载，主页面等其它页面分支不执行，因此不需要包装运行时函数。
  *
  * 所有模型类型统一用「屏幕 CSS 像素」做中间层，只用两个原语：
@@ -52,8 +53,6 @@
     ];
     // switchModelDisplay 在切换模型类型时派发，用于「还没就绪就先等着」。
     const MODE_SET_EVENT = 'neko-model-manager-mode-set';
-    // ── 「本页不写位置」相关 ──
-    const PREFERENCES_ENDPOINT = '/api/config/preferences';
     // 排查用：控制台执行 localStorage.setItem('nekoSafetyZoneDebug','1') 后，每次改写都会打印明细
     const DEBUG_FLAG_KEY = 'nekoSafetyZoneDebug';
 
@@ -65,8 +64,6 @@
     let clampTimers = [];
     let pointerDown = false;
     let stopped = false;
-    let storedPositionsPromise = null;
-    let storedPositionByPath = null;
     let loadSnapshotByType = new Map();
 
     function isMmPage() {
@@ -370,7 +367,21 @@
         captureLoadSnapshot();
         // 只记第一次：这是「进入页面之前」的位置，供离开时恢复。
         if (!savedCenter) savedCenter = { cx: current.x, cy: current.y };
-        applyCentering();
+        // 关键点：必须如实反映「这次到底有没有把模型搬成功」。
+        // applyCentering 内部经 moveModelScreenBy 搬模型，VRM 在运行时自己正在
+        // 自动移动或平滑转向（isVrmGuidedMovementActive 为真）时会直接返回 false，
+        // 表示「这次没搬」。旧写法忽略这个结果、一律返回 true，会让调度器
+        // armCentering 误以为已经居中而立即 stopPolling 停止轮询，只在之后约 1 秒内
+        // 补做几次复核；一旦这些复核也全部撞上「运行时正忙」，模型就永久停在加载时的
+        // 位置（也就是主页面位置）且不再重试——这正是 VRM 偶发不居中的成因。
+        // 改为：没搬成就返回 false，让轮询在 30 秒窗口内继续每 200ms 重试，直到搬成功。
+        const centered = applyCentering();
+        if (!centered) {
+            if (isDebugEnabled()) {
+                console.log('[安全区] 居中未成功（运行时正忙），保留轮询继续重试');
+            }
+            return false;
+        }
         scheduleCenteringReassert();
         return true;
     }
@@ -437,13 +448,24 @@
     }
 
     function restoreOnLeave() {
+        if (stopped || !isMmPage()) return;
         const saved = savedCenter;
         if (!saved) return;
-        savedCenter = null;
-        if (!isMmPage()) return;
         const current = getModelScreenCenter();
+        // 取不到当前中心时保留 savedCenter，留给下一次机会，避免状态被提前清空。
         if (!current) return;
-        moveModelScreenBy(saved.cx - current.x, saved.cy - current.y);
+        // 位移成功后才清 savedCenter：若位移失败（运行时正忙等），保留快照以便后续重试。
+        if (moveModelScreenBy(saved.cx - current.x, saved.cy - current.y)) {
+            savedCenter = null;
+        }
+    }
+
+    // pagehide 是「真正离开页面」才会触发的事件（beforeunload 会被「未保存确认」取消，
+    // 在那里恢复会把模型位置弄乱且丢掉 savedCenter）。进入 bfcache（persisted）时页面
+    // 可能被恢复，不还原位置，保留 savedCenter。
+    function onPageHide(event) {
+        if (event && event.persisted) return;
+        restoreOnLeave();
     }
 
     // clamp 只是软约束：夹在 [140, 25% 窗口宽] 之间，避免过小挡不住、过大把模型顶到屏外。
@@ -503,10 +525,21 @@
     }
 
     function bindWindowHooks() {
-        // 返回主页的两条路径（window.close / location.href='/'）都会触发卸载事件，
+        // 返回主页的两条路径（window.close / location.href='/'）都会触发 pagehide，
         // 因此不需要挂在按钮 click 上，避免用户取消「未保存确认」时把模型位置弄乱。
-        window.addEventListener('beforeunload', restoreOnLeave);
-        window.addEventListener('pagehide', restoreOnLeave);
+        // 只挂 pagehide：beforeunload 会被「未保存确认」取消，在那里恢复会提前清空
+        // savedCenter，导致真正离开时无法还原。
+        window.addEventListener('pagehide', onPageHide);
+        // unload 兜底：极少数只触发 unload 不触发 pagehide 的场景，仍恢复一次
+        // （pagehide 已恢复过时 savedCenter 为空，这里自动跳过）。
+        window.addEventListener('unload', () => {
+            restoreOnLeave();
+            stopped = true;
+            pointerDown = false;
+            stopReadinessWatch();
+            cancelPendingCentering();
+            cancelPendingClamps();
+        });
         // 用户一旦按下指针，就说明他要自己摆，立刻停掉所有自动摆位。
         window.addEventListener('pointerdown', () => {
             pointerDown = true;
@@ -521,21 +554,16 @@
             pointerDown = false;
             scheduleClampPasses();
         }, true);
-        window.addEventListener('unload', () => {
-            stopped = true;
-            pointerDown = false;
-            stopReadinessWatch();
-            cancelPendingCentering();
-            cancelPendingClamps();
-        });
     }
 
     // ═══════════════════ 本页不写位置 ═══════════════════
-    // 管理页会把模型临时摆到安全区中心，所以任何位置持久化都必须被替换成
-    // 「后端已经存着的那个位置」，否则下一次自动保存 / 点保存设置就会把居中位置
-    // 写回全局偏好，主页面也跟着变。位置连同解释它的 viewport/display 一起替换
-    // （否则「旧位置 + 新归一化基准」会让主页面渲染到别处）；缩放、旋转、参数、
-    // 相机等一律照原样保存。
+    // 管理页会把模型临时摆到安全区中心，所以本页保存位置必须打上隔离标记：改写函数
+    // 返回 preservePosition=true，运行时把它透传成请求体里的 preserve_position，后端见到
+    // 该标记且已有该模型记录时，会保留后端已存的 position/display/viewport 不覆盖，
+    // 于是管理页的临时摆位绝不落库，主页面不受影响。缩放、旋转、参数、相机等照常保存。
+    //
+    // 载荷里的 position 仍要给一个「合理值」：用「加载时快照」兜底（模型刚加载完、
+    // 本模块还没搬动它那一刻的位置），首次保存（后端还没有该模型记录）时后端就用它建记录。
     //
     // 调用方式是「运行时里判断」：Live2D / VRM / MMD 的 saveUserPreferences 开头会看
     // 本模块在不在，在就问它要一份改写后的参数；PNGTuber 那处直接在 page-controller
@@ -550,6 +578,14 @@
         return !needsZ || Number.isFinite(position.z);
     }
 
+    // 路径别名表：同一次模型加载里，「持久化键」和「实际用于加载配置的 URL」可能是两个
+    // 不同字符串。例如 Live2D 保存偏好用的是 currentModelInfo.path（后端按它建记录），
+    // 而运行时记录的 _lastLoadedModelPath 往往等于后端返回的 model_config_url。两者只是
+    // 指向同一个模型的两种写法，必须能互相匹配；否则加载时快照对不上，管理页居中位置
+    // 会以「首次建记录」的形式被写进偏好。
+    // 结构：归一化路径 -> 归一化持久化键（持久化键自身也登记，便于统一解析）。
+    const modelPathAliases = new Map();
+
     // 偏好里的模型路径形式不一定和调用方一致（历史原因），所以按运行时自己的策略匹配：
     // 精确 → 去掉 query/hash 归一化 → 文件名（小写）相同。（对齐 live2d-init.js / vrm-core.js）
     function normalizePreferencePath(value) {
@@ -558,55 +594,37 @@
         return raw.split('#')[0].split('?')[0].trim().replace(/\\/g, '/');
     }
 
-    // 只在两条路径都能确定、且归一化后完全一致时才算「同一个模型」。
+    // 登记一对别名：canonicalPath 是后端持久化用的键（如 currentModelInfo.path），
+    // aliasPath 是同一次加载里实际使用的配置 URL（如 model_config_url / _lastLoadedModelPath）。
+    // 两者都归一化后指向同一个键，之后 preferencePathMatches 就能把它们认成同一个模型。
+    // 空路径一律不登记：路径未知时宁可不匹配，也不能把位置记到别的模型头上。
+    function registerModelPathAlias(canonicalPath, aliasPath) {
+        const canonical = normalizePreferencePath(canonicalPath);
+        const alias = normalizePreferencePath(aliasPath);
+        if (!canonical || !alias) return false;
+        modelPathAliases.set(canonical, canonical);
+        modelPathAliases.set(alias, canonical);
+        return true;
+    }
+
+    // 只在两条路径都能确定、且能解析到同一个持久化键时才算「同一个模型」。
+    // 匹配顺序：归一化后完全相等 → 别名表里解析到同一个键。
     // 不做文件名兜底：同名文件可能分属不同模型，一旦猜错就会把别的模型的位置
     // 写到当前模型头上。匹配不上时宁可放弃替换，交给「加载时快照」兜底。
     function preferencePathMatches(candidate, target) {
         const left = normalizePreferencePath(candidate);
         const right = normalizePreferencePath(target);
-        if (!left || !right) return true;   // 路径未知时不否决
-        return left === right;
+        // 路径未知时一律拒绝匹配。旧实现这里返回 true（不否决），等于放任一个路径不明的
+        // 快照套到当前模型上，会把别的模型的位置写过来。
+        if (!left || !right) return false;
+        if (left === right) return true;
+        const leftCanonical = modelPathAliases.get(left);
+        const rightCanonical = modelPathAliases.get(right);
+        return !!leftCanonical && leftCanonical === rightCanonical;
     }
 
-    async function fetchStoredPositions() {
-        try {
-            const response = await window.fetch(PREFERENCES_ENDPOINT, { credentials: 'same-origin' });
-            if (!response || !response.ok) return null;
-            const data = await response.json();
-            const list = Array.isArray(data)
-                ? data
-                : (data && Array.isArray(data.preferences) ? data.preferences : null);
-            if (!list) return null;
-            const map = new Map();
-            list.forEach((entry) => {
-                if (!entry || typeof entry !== 'object') return;
-                const key = normalizePreferencePath(entry.model_path || entry.modelPath);
-                if (key) map.set(key, entry);
-            });
-            return map;
-        } catch (_) {
-            return null;
-        }
-    }
-
-    function ensureStoredPositions() {
-        if (!storedPositionsPromise) {
-            storedPositionsPromise = fetchStoredPositions().then((map) => {
-                if (map) storedPositionByPath = map;
-                return map;
-            });
-        }
-        return storedPositionsPromise;
-    }
-
-    function lookupStoredEntry(modelPath) {
-        const key = normalizePreferencePath(modelPath);
-        if (!key || !storedPositionByPath) return null;
-        return storedPositionByPath.get(key) || null;
-    }
-
-    // 模型加载完成、且本模块还没搬动它之前的位置。它要么等于后端存的位置（有偏好记录），
-    // 要么等于默认布局（没有记录），两种情况都正好是主页面会用的值。
+    // 模型加载完成、且本模块还没搬动它之前的位置。有偏好记录时它等于后端存的位置，
+    // 没有记录时它等于默认布局，两种情况都正好是主页面会用的值。
     function captureLoadSnapshot() {
         const type = getActiveModelType();
         let record = null;
@@ -641,28 +659,17 @@
         loadSnapshotByType.set(type, record);
     }
 
-    // 返回 null 表示「这次不替换」。
+    // 返回 null 表示「没有可用的加载时快照」，此时调用方按原值传位置
+    // （后端仍会用 preserve_position 兜住，不会让管理页的临时摆位落库）。
     function resolvePositionSubstitute(modelPath, incomingPosition) {
         const key = modelPath === undefined || modelPath === null ? '' : String(modelPath);
 
-        if (key) {
-            const entry = lookupStoredEntry(modelPath);
-            if (entry && isUsablePosition(entry.position, incomingPosition)) {
-                return {
-                    position: Object.assign({}, entry.position),
-                    display: entry.display,
-                    viewport: entry.viewport,
-                    replaceMeta: true
-                };
-            }
-        }
-
-        // 后端没有这条记录（或记录里没有可用位置）时，用「模型加载完、本模块还没搬动它」
-        // 那一刻的位置兜底 —— 那正好等于默认布局，也就是主页面会用的值。
+        // 用「模型加载完、本模块还没搬动它」那一刻的位置兜底 —— 那正好等于默认布局，
+        // 也就是主页面会用的值；首次保存（后端还没有该模型记录）时就靠它建记录。
         for (const record of loadSnapshotByType.values()) {
             if (!record || !isUsablePosition(record.position, incomingPosition)) continue;
             if (!preferencePathMatches(record.path, key)) continue;   // 不是同一个模型宁可不换
-            return { position: Object.assign({}, record.position), replaceMeta: false };
+            return { position: Object.assign({}, record.position) };
         }
 
         return null;
@@ -677,29 +684,34 @@
         }
     }
 
-    // 供运行时的 saveUserPreferences 调用：把一次位置写入改写成「后端原值」。
-    // 本函数保证不抛异常——出任何意外都原样返回入参，绝不让保存因为它而失败。
+    // 供运行时的 saveUserPreferences 调用：把一次位置写入标记为「后端保留已存位置」。
+    // 返回值里的 preservePosition 会被运行时透传成请求体的 preserve_position；载荷里的
+    // position/display/viewport 仍按本次入参给（有加载时快照就用快照位置兜底），供
+    // 后端在「还没有该模型记录」时建立初始记录。
+    // 本函数保证不抛异常——出任何意外都原样返回入参（preservePosition=false），
+    // 绝不让保存因为它而失败。
     async function rewritePositionWrite(modelPath, position, display, viewport) {
-        const fallback = { position, display, viewport };
+        const fallback = { position, display, viewport, preservePosition: false };
         try {
+            // 本模块只在管理页加载，这里再判一次页面类型，非管理页直接原样返回。
             if (!isMmPage() || stopped) return fallback;
-            await ensureStoredPositions();
             const substitute = resolvePositionSubstitute(modelPath, position);
+            const resolvedPosition = substitute ? substitute.position : position;
             if (isDebugEnabled()) {
                 console.log('[安全区] 位置写入改写', {
                     模型路径: modelPath,
                     本次要写的位置: position,
-                    改写后: substitute ? substitute.position : '(未改写，按原值)',
-                    来源: substitute ? (substitute.replaceMeta ? '后端已存记录' : '加载时快照') : '无',
-                    底账条数: storedPositionByPath ? storedPositionByPath.size : -1,
+                    载荷位置: resolvedPosition,
+                    来源: substitute ? '加载时快照' : '(无快照，按原值)',
+                    保留后端位置: true,
                     快照: Array.from(loadSnapshotByType.values()).map((r) => r.path)
                 });
             }
-            if (!substitute) return fallback;
             return {
-                position: substitute.position,
-                display: substitute.replaceMeta ? substitute.display : display,
-                viewport: substitute.replaceMeta ? substitute.viewport : viewport
+                position: resolvedPosition,
+                display,
+                viewport,
+                preservePosition: true
             };
         } catch (error) {
             console.warn('[模型管理] 位置写入改写失败，改按原值保存:', error);
@@ -714,14 +726,16 @@
         recenter: tryCenter,
         restoreOnLeave,
         clampAfterDrag,
-        rewritePositionWrite
+        rewritePositionWrite,
+        // 供页面在「同一次模型加载」里登记路径别名：持久化键（如 currentModelInfo.path）
+        // 与实际加载用的配置 URL（如 model_config_url / _lastLoadedModelPath）指向同一模型。
+        // 不登记的话，加载时快照的路径和保存时的路径可能对不上，隔离就会在首次建记录时漏掉。
+        registerModelPathAlias
     };
 
     function install() {
         if (!isMmPage() || stopped) return;
         bindWindowHooks();
-        // 先把「后端已存位置」的底账拉到内存，之后运行时的改写调用就是同步查表。
-        ensureStoredPositions();
         startReadinessWatch();
     }
 

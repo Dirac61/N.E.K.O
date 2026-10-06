@@ -6707,6 +6707,19 @@ document.addEventListener('DOMContentLoaded', async () => {
                 preferences: modelPreferences,
                 skipCloseWindows: true  // model_manager 页面不需要关闭其他窗口
             });
+            // 登记路径别名（位置隔离用）：保存偏好时传的是 modelInfo.path（后端按它建记录），
+            // 而运行时记录的 _lastLoadedModelPath 是本次实际加载用的配置 URL（等于 model_config_url
+            // 或 modelConfig.url）。两者指向同一个模型但字符串可能不同，必须显式绑定成一对别名，
+            // 否则安全区模块的「加载时快照」匹配不上保存路径，管理页居中的临时位置会在
+            // 首次建记录时被写进偏好。这里同时登记配置 URL 与运行时实际记录的路径，覆盖回退加载。
+            const safetyZone = window.ModelManagerSafetyZone;
+            if (safetyZone && typeof safetyZone.registerModelPathAlias === 'function') {
+                safetyZone.registerModelPathAlias(modelInfo.path, modelConfig.url);
+                safetyZone.registerModelPathAlias(
+                    modelInfo.path,
+                    window.live2dManager && window.live2dManager._lastLoadedModelPath
+                );
+            }
             live2dModel = window.live2dManager.getCurrentModel();
 
             // 添加模型交互监听器，跟踪位置和缩放变化

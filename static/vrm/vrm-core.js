@@ -1435,11 +1435,15 @@ class VRMCore {
             // 使管理页的临时摆位不影响主页面。该模块只在模型管理页加载，其他页面此分支不执行。
             // 注意必须在下面的 displaySnapshot 之前改写，否则改写后的 display 不会被用到。
             const positionScope = window.ModelManagerSafetyZone;
+            // 位置隔离标记：管理页改写结果置位后，透传成请求体的 preserve_position，
+            // 后端据此保留已存位置（管理页临时摆位不落库）。
+            let preservePosition = false;
             if (positionScope && typeof positionScope.rewritePositionWrite === 'function') {
                 const scoped = await positionScope.rewritePositionWrite(modelPath, position, display, viewport);
                 position = scoped.position;
                 display = scoped.display;
                 viewport = scoped.viewport;
+                preservePosition = scoped.preservePosition === true;
             }
             const displaySnapshot = display && typeof display.then === 'function'
                 ? display : display && { screenX: display.screenX, screenY: display.screenY };
@@ -1508,6 +1512,11 @@ class VRMCore {
                 }
             }
             
+            // 管理页位置隔离标记：请求后端保留已存位置，不让本次临时摆位落库。
+            if (preservePosition) {
+                preferences.preserve_position = true;
+            }
+
             // 显示器查询未完成也先占据写入顺序，所有调用入口共用队列。
             // 已完成的交互快照不会因后续模型切换而丢失。
             const write = async () => {

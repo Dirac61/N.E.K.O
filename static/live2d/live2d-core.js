@@ -1187,11 +1187,15 @@ class Live2DManager {
             // 模型管理页不写位置：把本次要写的 position/display/viewport 换回后端已存的值，
             // 使管理页的临时摆位不影响主页面。该模块只在模型管理页加载，其他页面此分支不执行。
             const positionScope = window.ModelManagerSafetyZone;
+            // 位置隔离标记：管理页改写结果置位后，透传成请求体的 preserve_position，
+            // 后端据此保留已存位置（管理页临时摆位不落库）。
+            let preservePosition = false;
             if (positionScope && typeof positionScope.rewritePositionWrite === 'function') {
                 const scoped = await positionScope.rewritePositionWrite(modelPath, position, display, viewport);
                 position = scoped.position;
                 display = scoped.display;
                 viewport = scoped.viewport;
+                preservePosition = scoped.preservePosition === true;
             }
             // 观看模式只读：viewer 不应把本地拖动覆盖到全局模型布局（也避免向 monitor 的只读端点 POST 触发 405）
             if (window.isViewerMode) {
@@ -1231,6 +1235,11 @@ class Live2DManager {
                     width: viewport.width,
                     height: viewport.height
                 };
+            }
+
+            // 管理页位置隔离标记：请求后端保留已存位置，不让本次临时摆位落库。
+            if (preservePosition) {
+                preferences.preserve_position = true;
             }
 
             const response = await fetch('/api/config/preferences', {

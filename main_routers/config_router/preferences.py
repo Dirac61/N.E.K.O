@@ -277,6 +277,9 @@ async def save_preferences(request: Request):
         viewport = data.get('viewport')
         # 获取相机位置信息（可选，用于恢复VRM滚轮缩放状态）
         camera_position = data.get('camera_position')
+        # 模型管理页位置隔离标记（可选）：为真且已有该模型记录时，后端保留已存的
+        # position/display/viewport，不让管理页的临时摆位写回全局偏好。
+        preserve_position = data.get('preserve_position') is True
 
         # 验证和清理 viewport 数据
         if viewport is not None:
@@ -293,7 +296,7 @@ async def save_preferences(request: Request):
         # 更新偏好（底层 atomic_write_json 会阻塞事件循环，offload 到线程池）
         ok = await asyncio.to_thread(
             update_model_preferences,
-            data['model_path'], data['position'], data['scale'], parameters, display, rotation, viewport, camera_position,
+            data['model_path'], data['position'], data['scale'], parameters, display, rotation, viewport, camera_position, preserve_position,
         )
         if ok:
             return {"success": True, "message": "偏好设置已保存"}

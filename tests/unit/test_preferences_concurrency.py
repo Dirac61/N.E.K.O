@@ -326,6 +326,96 @@ def test_model_update_and_conversation_write_share_one_rmw_lock(monkeypatch, tmp
     assert global_entry["focusModeEnabled"] is True
 
 
+def test_preserve_position_keeps_stored_position_and_meta(monkeypatch, tmp_path):
+    """With preserve_position true and an existing record, keep stored position and display/viewport."""
+    path = _use_preferences_file(
+        monkeypatch,
+        tmp_path,
+        [
+            {
+                "model_path": "model-a",
+                "position": {"x": 1, "y": 2},
+                "scale": {"x": 1, "y": 1},
+                "display": {"screenX": 10, "screenY": 20},
+                "viewport": {"width": 1920, "height": 1080},
+                "parameters": {"p": 1},
+            }
+        ],
+    )
+
+    ok = preferences.update_model_preferences(
+        "model-a",
+        {"x": 999, "y": 999},
+        {"x": 2, "y": 2},
+        display={"screenX": 999, "screenY": 999},
+        viewport={"width": 800, "height": 600},
+        preserve_position=True,
+    )
+    assert ok is True
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    entry = next(e for e in saved if e.get("model_path") == "model-a")
+    # 管理页传入的临时摆位不得覆盖后端已存的位置及其解释元数据
+    assert entry["position"] == {"x": 1, "y": 2}
+    assert entry["display"] == {"screenX": 10, "screenY": 20}
+    assert entry["viewport"] == {"width": 1920, "height": 1080}
+    # 其余字段仍照常更新/保留
+    assert entry["scale"] == {"x": 2, "y": 2}
+    assert entry["parameters"] == {"p": 1}
+
+
+def test_preserve_position_without_existing_record_uses_incoming_position(
+    monkeypatch, tmp_path
+):
+    """Before any record exists (first save), preserve_position builds the record from the incoming value."""
+    path = _use_preferences_file(monkeypatch, tmp_path, [])
+
+    ok = preferences.update_model_preferences(
+        "model-new",
+        {"x": 5, "y": 6},
+        {"x": 1, "y": 1},
+        preserve_position=True,
+    )
+    assert ok is True
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    entry = next(e for e in saved if e.get("model_path") == "model-new")
+    assert entry["position"] == {"x": 5, "y": 6}
+
+
+def test_preserve_position_drops_meta_absent_from_existing_record(
+    monkeypatch, tmp_path
+):
+    """A stored record without display/viewport must not gain a new baseline, avoiding an old-position/new-baseline mismatch."""
+    path = _use_preferences_file(
+        monkeypatch,
+        tmp_path,
+        [
+            {
+                "model_path": "model-a",
+                "position": {"x": 1, "y": 2},
+                "scale": {"x": 1, "y": 1},
+            }
+        ],
+    )
+
+    ok = preferences.update_model_preferences(
+        "model-a",
+        {"x": 999, "y": 999},
+        {"x": 1, "y": 1},
+        display={"screenX": 999, "screenY": 999},
+        viewport={"width": 800, "height": 600},
+        preserve_position=True,
+    )
+    assert ok is True
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    entry = next(e for e in saved if e.get("model_path") == "model-a")
+    assert "display" not in entry
+    assert "viewport" not in entry
+    assert entry["position"] == {"x": 1, "y": 2}
+
+
 class _Request:
     def __init__(
         self,
@@ -350,6 +440,36 @@ class _Request:
 
     async def json(self):
         return dict(self._body) if isinstance(self._body, dict) else self._body
+
+
+@pytest.mark.asyncio
+async def test_save_preferences_route_forwards_preserve_position(monkeypatch, tmp_path):
+    """POST /preferences must forward preserve_position to update_model_preferences."""
+    _use_preferences_file(monkeypatch, tmp_path, [])
+    captured = {}
+
+    def fake_update(*args, **kwargs):
+        captured["args"] = args
+        return True
+
+    monkeypatch.setattr(
+        preferences_router, "update_model_preferences", fake_update
+    )
+
+    response = await preferences_router.save_preferences(
+        _Request(
+            {
+                "model_path": "model-a",
+                "position": {"x": 1, "y": 2},
+                "scale": {"x": 1, "y": 1},
+                "preserve_position": True,
+            }
+        )
+    )
+
+    assert response["success"] is True
+    # update_model_preferences 的位置参数顺序：... camera_position, preserve_position
+    assert captured["args"][-1] is True
 
 
 @pytest.mark.asyncio
